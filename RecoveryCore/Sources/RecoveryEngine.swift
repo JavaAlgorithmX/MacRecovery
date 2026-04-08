@@ -169,7 +169,11 @@ public final class RecoveryEngine {
         startTime        = Date()
         _cancelRequested = false
         _pauseRequested  = false
-        log.info("RecoveryEngine starting \(self.config.mode.rawValue) scan on \(devicePath)")
+
+        print("╔══ SCAN START ═══════════════════════════════════════")
+        print("║  Device : \(devicePath)")
+        print("║  Mode   : \(config.mode.rawValue)")
+        print("╚════════════════════════════════════════════════════")
 
         report(.opening, qp: 0, dp: 0, pct: 0, candidates: 0,
                bad: 0, sector: 0, callback: onProgress)
@@ -179,17 +183,20 @@ public final class RecoveryEngine {
                                sectorSize: device.sectorSize)
         self.sectorMap = map
 
+        print("[Engine] Device opened — \(device.totalBytes / 1_000_000_000) GB, \(device.totalSectors) sectors @ \(device.sectorSize)B")
+
         var allCandidates: [FileCandidate] = []
 
         // Quick scan
         if config.mode == .quick || config.mode == .both {
+            print("[Engine] ── Quick Scan starting ──────────────────────")
             report(.quickScan, qp: 0, dp: 0, pct: 2,
                    candidates: 0, bad: 0, sector: 0,
                    path: "Scanning \(devicePath)…", callback: onProgress)
             let quickResults = runQuickScan(device: device, map: map,
                                             onProgress: onProgress)
             allCandidates.append(contentsOf: quickResults)
-            log.info("Quick scan: \(quickResults.count) candidates")
+            print("[Engine] Quick scan done — \(quickResults.count) candidates")
         }
 
         // Check for cancellation between phases
@@ -197,6 +204,7 @@ public final class RecoveryEngine {
 
         // Deep scan
         if config.mode == .deep || config.mode == .both {
+            print("[Engine] ── Deep Scan starting ───────────────────────")
             let (deepResults, pausedAt) = try await runDeepScan(
                 device:             device,
                 map:                map,
@@ -205,10 +213,11 @@ public final class RecoveryEngine {
                 onProgress:         onProgress
             )
             allCandidates.append(contentsOf: deepResults)
-            log.info("Deep scan: \(deepResults.count) additional candidates")
+            print("[Engine] Deep scan done — \(deepResults.count) new candidates")
 
             // Paused mid-scan — save checkpoint and return partial result
             if let pausedSector = pausedAt {
+                print("[Engine] Scan paused at sector \(pausedSector)")
                 let cpURL = try saveCheckpoint(
                     devicePath:   devicePath,
                     resumeSector: pausedSector,
@@ -230,11 +239,20 @@ public final class RecoveryEngine {
         }
 
         // Organising phase — deduplicate and sort
+        print("[Engine] ── Organising \(allCandidates.count) total candidates ──────")
         report(.organising, qp: 100, dp: 100, pct: 98,
                candidates: allCandidates.count,
                bad: map.badSectors().count,
                sector: device.totalSectors, callback: onProgress)
         let organised = deduplicateCandidates(allCandidates)
+
+        let elapsed = Date().timeIntervalSince(startTime!)
+        print("╔══ SCAN COMPLETE ════════════════════════════════════")
+        print("║  Files found   : \(organised.count)")
+        print("║  Bad sectors   : \(map.badSectors().count)")
+        print("║  Sectors scanned: \(map.progress().scanned)")
+        print("║  Elapsed       : \(String(format: "%.1f", elapsed))s")
+        print("╚════════════════════════════════════════════════════")
 
         report(.complete, qp: 100, dp: 100, pct: 100,
                candidates: organised.count,
@@ -394,9 +412,10 @@ public final class RecoveryEngine {
                                onProgress: ((ScanProgress) -> Void)?) -> [FileCandidate] {
         var results: [FileCandidate] = []
         let fsType = detectFileSystem(device)
-        log.info("Detected file system: \(fsType.rawValue)")
+        print("[QuickScan] Detected filesystem: \(fsType.rawValue)")
 
-        let pathCallback: (String) -> Void = { path in
+        let pathCallback: (String) -> Void = { [self] path in
+            print("[QuickScan] Scanning: \(path)  (\(results.count) found so far)")
             onProgress?(ScanProgress(
                 phase: .quickScan, percent: 50,
                 quickScanPercent: 50, deepScanPercent: 0,
@@ -409,33 +428,37 @@ public final class RecoveryEngine {
 
         switch fsType {
         case .hfsPlus:
+            print("[QuickScan] Running HFS+ parser")
             do {
                 results = try HFSParser.findDeletedFiles(device: device,
                                                          sectorMap: map,
                                                          onPath: pathCallback)
             } catch {
-                log.warning("HFS+ quick scan failed: \(error.localizedDescription)")
+                print("[QuickScan] HFS+ parser error: \(error)")
             }
         case .apfs:
+            print("[QuickScan] Running APFS parser")
             do {
                 results = try APFSParser.findFiles(device: device,
                                                    sectorMap: map,
                                                    onPath: pathCallback)
             } catch {
-                log.warning("APFS quick scan failed: \(error.localizedDescription)")
+                print("[QuickScan] APFS parser error: \(error)")
             }
         case .fat32, .exFAT:
+            print("[QuickScan] Running FAT/exFAT parser")
             do {
                 results = try FATParser.findFiles(device: device,
                                                   sectorMap: map,
                                                   onPath: pathCallback)
             } catch {
-                log.warning("FAT quick scan failed: \(error.localizedDescription)")
+                print("[QuickScan] FAT parser error: \(error)")
             }
         default:
-            log.warning("Unrecognised file system — quick scan skipped, use deep scan")
+            print("[QuickScan] Unknown filesystem — skipping quick scan")
         }
 
+        print("[QuickScan] Done — \(results.count) candidates")
         return results
     }
 
@@ -468,6 +491,8 @@ public final class RecoveryEngine {
         let totalBytes    = device.totalBytes
         let quickDone     = (config.mode == .both || config.mode == .quick)
         var speedSamples: [(time: Date, bytes: UInt64)] = []
+
+        print("[DeepScan] Starting at sector \(resumeSector) / \(device.totalSectors) total")
 
         while sector < device.totalSectors {
 
@@ -524,6 +549,7 @@ public final class RecoveryEngine {
                 )
                 results.append(candidate)
                 map.mark(sector: detSector, as: .candidate)
+                print("[DeepScan] ✓ Found \(detection.fileType.rawValue) at sector \(detSector) (~\(sectorCount * UInt64(device.sectorSize) / 1024)KB) [\(recoverability)]")
                 if results.count >= config.maxCandidates { break }
             }
 
@@ -535,6 +561,8 @@ public final class RecoveryEngine {
 
             let progressEvery: UInt64 = 1024
             if sector % progressEvery == 0 {
+                let pct = device.totalSectors > 0 ? Int(sector * 100 / device.totalSectors) : 0
+                print("[DeepScan] sector \(sector)/\(device.totalSectors) (\(pct)%) — \(results.count) found")
                 let p = map.progress()
                 speedSamples.append((Date(), bytesRead))
                 if speedSamples.count > 10 { speedSamples.removeFirst() }

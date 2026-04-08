@@ -116,6 +116,7 @@ final class ScanViewModel: ObservableObject {
         scanError       = nil
         progress        = nil
         result          = nil
+        print("[ViewModel] startScan → device=\(devicePath) mode=\(scanMode.rawValue)")
 
         var config         = ScanConfiguration()
         config.mode        = scanMode
@@ -132,7 +133,10 @@ final class ScanViewModel: ObservableObject {
 
             let (stream, task) = engine.scanStream(devicePath: devicePath)
 
-            for await p in stream { self.progress = p }
+            for await p in stream {
+                self.progress = p
+                print("[ViewModel] progress: \(p.phase.rawValue) \(Int(p.percent))% sector=\(p.currentSector) candidates=\(p.candidateCount)")
+            }
 
             do {
                 let scanResult      = try await task.value
@@ -140,9 +144,12 @@ final class ScanViewModel: ObservableObject {
                 self.candidateIndex = CandidateIndex(result: scanResult)
                 self.summary        = CategorySummary(candidates: scanResult.candidates)
                 self.appPhase       = .results
+                print("[ViewModel] Scan complete → \(scanResult.candidates.count) files, navigating to results")
             } catch is CancellationError {
+                print("[ViewModel] Scan cancelled")
                 self.appPhase = .driveSelection
             } catch {
+                print("[ViewModel] Scan error: \(error)")
                 self.scanError = error.localizedDescription
                 self.appPhase  = .driveSelection
             }
