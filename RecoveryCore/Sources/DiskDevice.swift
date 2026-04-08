@@ -51,12 +51,18 @@ public final class DiskDevice {
             throw DiskError.statFailed(path: path, errno: errno)
         }
 
-        if (st.st_mode & S_IFMT) == S_IFBLK {
-            // Block device — use IOKit ioctl
+        let fileType = st.st_mode & S_IFMT
+        let isDevice = fileType == S_IFBLK || fileType == S_IFCHR   // macOS /dev/disk* are S_IFCHR
+        fputs("[DiskDevice] \(path) fileType=0x\(String(fileType, radix:16)) isDevice=\(isDevice)\n", stderr)
+
+        if isDevice {
+            // Device node — use IOKit ioctl to get real size
             var blockCount: UInt64 = 0
             var blockSize:  UInt32 = 0
-            if ioctl(fd, _DKIOCGETBLOCKCOUNT, &blockCount) == 0,
-               ioctl(fd, _DKIOCGETBLOCKSIZE, &blockSize) == 0 {
+            let r1 = ioctl(fd, _DKIOCGETBLOCKCOUNT, &blockCount)
+            let r2 = ioctl(fd, _DKIOCGETBLOCKSIZE,  &blockSize)
+            fputs("[DiskDevice] ioctl r1=\(r1) r2=\(r2) blockCount=\(blockCount) blockSize=\(blockSize)\n", stderr)
+            if r1 == 0, r2 == 0 {
                 totalBytes = blockCount * UInt64(blockSize)
             } else {
                 Darwin.close(fd)
@@ -64,12 +70,14 @@ public final class DiskDevice {
             }
 
             // APFS container partitions (e.g. disk6s1) report blockCount=0 because
-            // the block map is owned by the synthesised APFS disk, not the slice.
-            // Fall back to the whole-disk node (disk6) which does report a size.
-            if totalBytes == 0, let wholeDisk = wholeDiskPath(path) {
-                Darwin.close(fd)
-                fputs("[DiskDevice] \(path) reported 0 bytes — retrying with \(wholeDisk)\n", stderr)
-                return try DiskDevice.open(path: wholeDisk, sectorSize: sectorSize)
+            // the block map is owned by the synthesised APFS virtual disk, not the slice.
+            // Fall back to the whole-disk node (disk6) which correctly reports the size.
+            if totalBytes == 0 {
+                if let wholeDisk = wholeDiskPath(path) {
+                    Darwin.close(fd)
+                    fputs("[DiskDevice] \(path) blockCount=0 — retrying with \(wholeDisk)\n", stderr)
+                    return try DiskDevice.open(path: wholeDisk, sectorSize: sectorSize)
+                }
             }
         } else {
             // Regular file (disk image)
