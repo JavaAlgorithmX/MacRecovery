@@ -52,33 +52,30 @@ public final class DiskDevice {
         }
 
         let fileType = st.st_mode & S_IFMT
-        let isDevice = fileType == S_IFBLK || fileType == S_IFCHR   // macOS /dev/disk* are S_IFCHR
+        let isDevice = fileType == S_IFBLK || fileType == S_IFCHR
         fputs("[DiskDevice] \(path) fileType=0x\(String(fileType, radix:16)) isDevice=\(isDevice)\n", stderr)
 
         if isDevice {
-            // Device node — use IOKit ioctl to get real size
-            var blockCount: UInt64 = 0
-            var blockSize:  UInt32 = 0
-            let r1 = ioctl(fd, _DKIOCGETBLOCKCOUNT, &blockCount)
-            let r2 = ioctl(fd, _DKIOCGETBLOCKSIZE,  &blockSize)
-            fputs("[DiskDevice] ioctl r1=\(r1) r2=\(r2) blockCount=\(blockCount) blockSize=\(blockSize)\n", stderr)
+            // Strategy 1: lseek(SEEK_END) — works on all device types without ioctls
+            let seekSize = lseek(fd, 0, SEEK_END)
+            lseek(fd, 0, SEEK_SET)
+            fputs("[DiskDevice] lseek SEEK_END → \(seekSize)\n", stderr)
 
-            // APFS container partitions (e.g. disk6s1) either fail the ioctl with
-            // ENOTTY or succeed but return blockCount=0.  In both cases fall back
-            // to the whole-disk node (disk6) which does support the ioctls.
-            let ioctlFailed = r1 != 0 || r2 != 0
-            let ioctlEmpty  = !ioctlFailed && blockCount * UInt64(blockSize) == 0
-            if (ioctlFailed || ioctlEmpty), let wholeDisk = wholeDiskPath(path) {
-                Darwin.close(fd)
-                fputs("[DiskDevice] \(path) not scannable (ioctl failed or 0 bytes) — retrying with \(wholeDisk)\n", stderr)
-                return try DiskDevice.open(path: wholeDisk, sectorSize: sectorSize)
-            }
-
-            if r1 == 0, r2 == 0 {
-                totalBytes = blockCount * UInt64(blockSize)
+            if seekSize > 0 {
+                totalBytes = UInt64(seekSize)
             } else {
-                Darwin.close(fd)
-                throw DiskError.ioctlFailed(path: path, errno: errno)
+                // Strategy 2: IOKit ioctls (fallback for devices where lseek returns 0)
+                var blockCount: UInt64 = 0
+                var blockSize:  UInt32 = 0
+                let r1 = ioctl(fd, _DKIOCGETBLOCKCOUNT, &blockCount)
+                let r2 = ioctl(fd, _DKIOCGETBLOCKSIZE,  &blockSize)
+                fputs("[DiskDevice] ioctl r1=\(r1) r2=\(r2) blockCount=\(blockCount) blockSize=\(blockSize)\n", stderr)
+                if r1 == 0, r2 == 0, blockCount > 0 {
+                    totalBytes = blockCount * UInt64(blockSize)
+                } else {
+                    Darwin.close(fd)
+                    throw DiskError.ioctlFailed(path: path, errno: errno)
+                }
             }
         } else {
             // Regular file (disk image)
