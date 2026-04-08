@@ -7,6 +7,8 @@ struct ScanProgressView: View {
     private var p: ScanProgress? { vm.progress }
     private var pct: Double { p?.percent ?? 0 }
 
+    @State private var showStopConfirm = false
+
     var body: some View {
         ZStack {
             VisualEffectBackground().ignoresSafeArea()
@@ -175,11 +177,13 @@ struct ScanProgressView: View {
 
     private var controls: some View {
         HStack(spacing: 14) {
-            Button(action: vm.cancelScan) {
-                Label("Cancel", systemImage: "xmark.circle")
+            // Stop — shows confirmation dialog before cancelling
+            Button(action: { showStopConfirm = true }) {
+                Label("Stop", systemImage: "stop.circle")
                     .frame(minWidth: 110)
             }
             .buttonStyle(.bordered)
+            .tint(.mrRose)
             .keyboardShortcut(.cancelAction)
 
             Button(action: vm.pauseScan) {
@@ -188,6 +192,19 @@ struct ScanProgressView: View {
             }
             .buttonStyle(.bordered)
             .tint(.mrAmber)
+        }
+        .sheet(isPresented: $showStopConfirm) {
+            StopScanDialog(
+                filesScanned: p?.candidateCount ?? 0,
+                eta:          p?.eta ?? 0,
+                onStop: {
+                    showStopConfirm = false
+                    vm.cancelScan()
+                },
+                onCancel: {
+                    showStopConfirm = false
+                }
+            )
         }
     }
 
