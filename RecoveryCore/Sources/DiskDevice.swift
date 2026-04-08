@@ -30,7 +30,12 @@ public final class DiskDevice {
 
     public static func open(path: String,
                             sectorSize: UInt32 = 512) throws -> DiskDevice {
-        let fd = Darwin.open(path, O_RDONLY | O_NONBLOCK)
+        // Try block device first, then raw device (rdisk) as fallback
+        var fd = Darwin.open(path, O_RDONLY | O_NONBLOCK)
+        if fd < 0 && path.contains("/dev/disk") {
+            let rawPath = path.replacingOccurrences(of: "/dev/disk", with: "/dev/rdisk")
+            fd = Darwin.open(rawPath, O_RDONLY | O_NONBLOCK)
+        }
         guard fd >= 0 else {
             throw DiskError.openFailed(path: path, errno: errno)
         }
