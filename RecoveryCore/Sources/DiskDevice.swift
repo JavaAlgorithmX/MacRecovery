@@ -62,6 +62,15 @@ public final class DiskDevice {
                 Darwin.close(fd)
                 throw DiskError.ioctlFailed(path: path, errno: errno)
             }
+
+            // APFS container partitions (e.g. disk6s1) report blockCount=0 because
+            // the block map is owned by the synthesised APFS disk, not the slice.
+            // Fall back to the whole-disk node (disk6) which does report a size.
+            if totalBytes == 0, let wholeDisk = wholeDiskPath(path) {
+                Darwin.close(fd)
+                fputs("[DiskDevice] \(path) reported 0 bytes — retrying with \(wholeDisk)\n", stderr)
+                return try DiskDevice.open(path: wholeDisk, sectorSize: sectorSize)
+            }
         } else {
             // Regular file (disk image)
             totalBytes = UInt64(st.st_size)
@@ -69,6 +78,7 @@ public final class DiskDevice {
 
         let totalSectors = totalBytes / UInt64(sectorSize)
         log.info("Opened \(path): \(totalBytes) bytes, \(totalSectors) sectors @ \(sectorSize)B")
+        fputs("[DiskDevice] Opened \(path): \(totalBytes) bytes (\(totalBytes / 1_000_000_000) GB), \(totalSectors) sectors\n", stderr)
 
         return DiskDevice(path: path, fd: fd,
                           sectorSize: sectorSize,
@@ -168,6 +178,16 @@ public final class DiskDevice {
         self.sectorSize   = sectorSize
         self.totalSectors = totalSectors
         self.totalBytes   = totalBytes
+    }
+
+    /// Strip the partition suffix from a BSD device path.
+    /// "/dev/disk6s1" → "/dev/disk6",  "/dev/rdisk6s2" → "/dev/rdisk6"
+    /// Returns nil if the path has no partition suffix (already a whole-disk node).
+    private static func wholeDiskPath(_ path: String) -> String? {
+        guard let range = path.range(of: #"s\d+$"#, options: .regularExpression) else {
+            return nil
+        }
+        return String(path[..<range.lowerBound])
     }
 }
 
