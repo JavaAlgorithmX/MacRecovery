@@ -171,14 +171,22 @@ struct ResultsView: View {
 
     private var breadcrumbBar: some View {
         HStack(spacing: 6) {
-            // Back to home
+            // Back to home — labelled so it's obvious
             Button(action: vm.resetToStart) {
-                Image(systemName: "house")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 11, weight: .semibold))
+                    Text("New Scan")
+                        .font(.system(size: 12, weight: .medium))
+                }
+                .foregroundStyle(.mrTeal)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.mrTeal.opacity(0.10))
+                .clipShape(RoundedRectangle(cornerRadius: 5))
             }
             .buttonStyle(.plain)
-            .help("New scan")
+            .help("Return to drive selection")
 
             // Back within browse
             if selectedCategory != nil {
@@ -752,11 +760,49 @@ struct ResultsView: View {
             Image(systemName: "doc.badge.questionmark")
                 .font(.system(size: 44))
                 .foregroundStyle(.secondary.opacity(0.35))
+
             Text("No files found")
+                .font(.headline)
                 .foregroundStyle(.secondary)
-            if !searchText.isEmpty {
-                Button("Clear search") { searchText = "" }
-                    .font(.caption).foregroundStyle(.mrTeal)
+
+            if !searchText.isEmpty || isAnyFilterActive {
+                Text("Try clearing your search or filters.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                HStack(spacing: 10) {
+                    if !searchText.isEmpty {
+                        Button("Clear search") { searchText = "" }
+                            .font(.caption).foregroundStyle(.mrTeal)
+                    }
+                    if isAnyFilterActive {
+                        Button("Clear filters") { clearAllFilters() }
+                            .font(.caption).foregroundStyle(.mrTeal)
+                    }
+                }
+            } else if let result = vm.result {
+                let sectors = result.sectorsScanned
+                let secs = result.duration.map { Int($0) } ?? 0
+                Text("Scanned \(sectors.formatted()) sectors on \(vm.effectiveDisplayName)" +
+                     (secs > 0 ? " in \(secs)s" : "") + ".\nNo recoverable files were detected.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 360)
+
+                Button(action: vm.resetToStart) {
+                    Label("Try a Different Disk or Scan Mode", systemImage: "arrow.counterclockwise")
+                        .font(.system(size: 13, weight: .medium))
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.mrTeal)
+            } else {
+                Button(action: vm.resetToStart) {
+                    Label("Start New Scan", systemImage: "arrow.counterclockwise")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.mrTeal)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
