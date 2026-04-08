@@ -62,22 +62,23 @@ public final class DiskDevice {
             let r1 = ioctl(fd, _DKIOCGETBLOCKCOUNT, &blockCount)
             let r2 = ioctl(fd, _DKIOCGETBLOCKSIZE,  &blockSize)
             fputs("[DiskDevice] ioctl r1=\(r1) r2=\(r2) blockCount=\(blockCount) blockSize=\(blockSize)\n", stderr)
+
+            // APFS container partitions (e.g. disk6s1) either fail the ioctl with
+            // ENOTTY or succeed but return blockCount=0.  In both cases fall back
+            // to the whole-disk node (disk6) which does support the ioctls.
+            let ioctlFailed = r1 != 0 || r2 != 0
+            let ioctlEmpty  = !ioctlFailed && blockCount * UInt64(blockSize) == 0
+            if (ioctlFailed || ioctlEmpty), let wholeDisk = wholeDiskPath(path) {
+                Darwin.close(fd)
+                fputs("[DiskDevice] \(path) not scannable (ioctl failed or 0 bytes) — retrying with \(wholeDisk)\n", stderr)
+                return try DiskDevice.open(path: wholeDisk, sectorSize: sectorSize)
+            }
+
             if r1 == 0, r2 == 0 {
                 totalBytes = blockCount * UInt64(blockSize)
             } else {
                 Darwin.close(fd)
                 throw DiskError.ioctlFailed(path: path, errno: errno)
-            }
-
-            // APFS container partitions (e.g. disk6s1) report blockCount=0 because
-            // the block map is owned by the synthesised APFS virtual disk, not the slice.
-            // Fall back to the whole-disk node (disk6) which correctly reports the size.
-            if totalBytes == 0 {
-                if let wholeDisk = wholeDiskPath(path) {
-                    Darwin.close(fd)
-                    fputs("[DiskDevice] \(path) blockCount=0 — retrying with \(wholeDisk)\n", stderr)
-                    return try DiskDevice.open(path: wholeDisk, sectorSize: sectorSize)
-                }
             }
         } else {
             // Regular file (disk image)
