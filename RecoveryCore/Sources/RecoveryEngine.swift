@@ -361,11 +361,11 @@ public final class RecoveryEngine {
     ) -> (stream: AsyncStream<ScanProgress>, task: Task<ScanResult, Error>) {
         var continuation: AsyncStream<ScanProgress>.Continuation!
         let stream = AsyncStream<ScanProgress> { cont in continuation = cont }
-        let task = Task {
+        let task = Task.detached {
+            defer { continuation.finish() }
             let result = try await self.scan(devicePath: devicePath) { progress in
                 continuation.yield(progress)
             }
-            continuation.finish()
             return result
         }
         return (stream, task)
@@ -377,11 +377,11 @@ public final class RecoveryEngine {
     ) -> (stream: AsyncStream<ScanProgress>, task: Task<ScanResult, Error>) {
         var continuation: AsyncStream<ScanProgress>.Continuation!
         let stream = AsyncStream<ScanProgress> { cont in continuation = cont }
-        let task = Task {
+        let task = Task.detached {
+            defer { continuation.finish() }
             let result = try await self.resume(checkpointURL: checkpointURL) { progress in
                 continuation.yield(progress)
             }
-            continuation.finish()
             return result
         }
         return (stream, task)
@@ -458,15 +458,7 @@ public final class RecoveryEngine {
             .sorted { $0.lowerBound < $1.lowerBound }
 
         func isClaimed(_ sector: UInt64) -> Bool {
-            // Binary-search for the last range whose lowerBound <= sector,
-            // then check whether that range actually contains the sector.
-            var lo = 0, hi = claimedRanges.count
-            while lo < hi {
-                let mid = (lo + hi) / 2
-                if claimedRanges[mid].lowerBound <= sector { lo = mid + 1 }
-                else { hi = mid }
-            }
-            return lo > 0 && claimedRanges[lo - 1].contains(sector)
+            RecoveryEngine.isInClaimedRanges(sector, ranges: claimedRanges)
         }
 
         var results:      [FileCandidate] = []
@@ -677,6 +669,19 @@ public final class RecoveryEngine {
         let seconds = last.time.timeIntervalSince(first.time)
         guard seconds > 0.001 else { return 0 }
         return Double(last.bytes - first.bytes) / seconds / 1_048_576
+    }
+
+    /// Binary-search `ranges` (must be sorted by lowerBound) for `sector`.
+    /// Internal so tests can exercise the lookup without running a full scan.
+    static func isInClaimedRanges(_ sector: UInt64,
+                                   ranges: [Range<UInt64>]) -> Bool {
+        var lo = 0, hi = ranges.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if ranges[mid].lowerBound <= sector { lo = mid + 1 }
+            else { hi = mid }
+        }
+        return lo > 0 && ranges[lo - 1].contains(sector)
     }
 }
 

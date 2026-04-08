@@ -32,6 +32,19 @@ struct ContentView: View {
             ScanOptionsSheet()
                 .environmentObject(vm)
         }
+        .alert("Scan Failed", isPresented: Binding(
+            get: { vm.scanError != nil },
+            set: { if !$0 { vm.scanError = nil } }
+        )) {
+            Button("OK") { vm.scanError = nil }
+        } message: {
+            if let err = vm.scanError {
+                Text(err)
+                if err.lowercased().contains("permission") || err.lowercased().contains("operation not permitted") || err.lowercased().contains("eperm") || err.lowercased().contains("eacces") {
+                    Text("\n\nGo to System Settings → Privacy & Security → Full Disk Access and enable MacRecovery (or Terminal if running via CLI).")
+                }
+            }
+        }
         .animation(.spring(response: 0.38, dampingFraction: 0.88), value: vm.appPhase)
         .onAppear { vm.loadVolumes() }
     }
