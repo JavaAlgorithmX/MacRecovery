@@ -30,14 +30,20 @@ public final class DiskDevice {
 
     public static func open(path: String,
                             sectorSize: UInt32 = 512) throws -> DiskDevice {
-        // Try block device first, then raw device (rdisk) as fallback
-        var fd = Darwin.open(path, O_RDONLY | O_NONBLOCK)
-        if fd < 0 && path.contains("/dev/disk") {
-            let rawPath = path.replacingOccurrences(of: "/dev/disk", with: "/dev/rdisk")
-            fd = Darwin.open(rawPath, O_RDONLY | O_NONBLOCK)
+        // macOS raw devices (/dev/rdisk*) support DK ioctls and unbuffered I/O.
+        // Block device nodes (/dev/disk*) do NOT support DKIOCGETBLOCKCOUNT or
+        // lseek(SEEK_END). Always use the raw path for /dev/disk* entries.
+        let effectivePath: String
+        if path.hasPrefix("/dev/disk") {
+            effectivePath = "/dev/r" + path.dropFirst("/dev/".count)  // disk6 → rdisk6
+        } else {
+            effectivePath = path
         }
+        fputs("[DiskDevice] open: \(path) → \(effectivePath)\n", stderr)
+
+        let fd = Darwin.open(effectivePath, O_RDONLY | O_NONBLOCK)
         guard fd >= 0 else {
-            throw DiskError.openFailed(path: path, errno: errno)
+            throw DiskError.openFailed(path: effectivePath, errno: errno)
         }
 
         // Determine device size.
