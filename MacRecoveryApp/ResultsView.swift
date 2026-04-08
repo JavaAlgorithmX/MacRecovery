@@ -3,8 +3,48 @@ import RecoveryCore
 
 // MARK: - View mode
 
-private enum ResultsViewMode { case list, grid }
+private enum ResultsViewMode   { case list, grid }
 private enum ResultsSidebarMode { case path, type }
+
+// MARK: - Filter enums
+
+enum FilterSizeRange: String, CaseIterable, Identifiable {
+    case tiny   = "< 1 MB"
+    case small  = "1–10 MB"
+    case medium = "10–100 MB"
+    case large  = "> 100 MB"
+
+    var id: String { rawValue }
+
+    func contains(_ bytes: UInt64) -> Bool {
+        switch self {
+        case .tiny:   return bytes < 1_000_000
+        case .small:  return bytes >= 1_000_000   && bytes < 10_000_000
+        case .medium: return bytes >= 10_000_000  && bytes < 100_000_000
+        case .large:  return bytes >= 100_000_000
+        }
+    }
+}
+
+enum FilterDateRange: String, CaseIterable, Identifiable {
+    case today = "Today"
+    case week  = "This Week"
+    case month = "This Month"
+    case year  = "This Year"
+
+    var id: String { rawValue }
+
+    func contains(_ date: Date) -> Bool {
+        let cal  = Calendar.current
+        let now  = Date()
+        switch self {
+        case .today: return cal.isDateInToday(date)
+        case .week:  return cal.isDate(date, equalTo: now, toGranularity: .weekOfYear)
+        case .month: return cal.isDate(date, equalTo: now, toGranularity: .month)
+        case .year:  return cal.isDate(date, equalTo: now, toGranularity: .year)
+        }
+    }
+}
 
 // MARK: - ResultsView
 // Matches UI-Plan screens 5, 6, 8, 9:
@@ -25,10 +65,21 @@ struct ResultsView: View {
     @State private var viewMode: ResultsViewMode = .grid
 
     // Filter / search
-    @State private var showFilters  = false
-    @State private var searchText   = ""
-    @State private var sortOrder:   RecoveryCore.SortOrder = .recoverability
-    @State private var sortAscending = false
+    @State private var showFilters        = false
+    @State private var searchText         = ""
+    @State private var sortOrder:          RecoveryCore.SortOrder = .recoverability
+    @State private var sortAscending       = false
+
+    // Active filter values (nil = no filter applied)
+    @State private var filterScore:        RecoverabilityScore?  = nil
+    @State private var filterCategory:     FileCategory?         = nil
+    @State private var filterSizeRange:    FilterSizeRange?      = nil
+    @State private var filterDateRange:    FilterDateRange?       = nil
+
+    private var isAnyFilterActive: Bool {
+        filterScore != nil || filterCategory != nil
+        || filterSizeRange != nil || filterDateRange != nil
+    }
 
     // Recovery sheet
     @State private var showRecovery = false
@@ -42,15 +93,42 @@ struct ResultsView: View {
 
     private var displayedCandidates: [FileCandidate] {
         guard let index = vm.candidateIndex else { return [] }
-        let categories: Set<FileCategory>? = selectedCategory.map { Set([$0]) }
+
+        // Resolve active category: sidebar selection takes priority over filter pill
+        let effectiveCategory = selectedCategory ?? filterCategory
+        let categories: Set<FileCategory>? = effectiveCategory.map { Set([$0]) }
+
         let q = CandidateQuery(
             nameContains: searchText.isEmpty ? nil : searchText,
             categories:   categories,
-            minScore:     nil,
+            minScore:     filterScore,
             sortBy:       sortOrder,
             ascending:    sortAscending
         )
-        return index.search(query: q)
+        var results = index.search(query: q)
+
+        // Size filter
+        if let sizeRange = filterSizeRange {
+            results = results.filter { sizeRange.contains($0.estimatedSize) }
+        }
+
+        // Date filter
+        if let dateRange = filterDateRange {
+            results = results.filter { c in
+                guard let d = c.modificationDate else { return false }
+                return dateRange.contains(d)
+            }
+        }
+
+        return results
+    }
+
+    private func clearAllFilters() {
+        filterScore     = nil
+        filterCategory  = nil
+        filterSizeRange = nil
+        filterDateRange = nil
+        searchText      = ""
     }
 
     // MARK: Body
@@ -209,39 +287,157 @@ struct ResultsView: View {
         .help(mode == .list ? "List view" : "Grid view")
     }
 
-    // MARK: - Filter bar (stub — populated in step 5)
+    // MARK: - Filter bar
 
     private var filterBar: some View {
         HStack(spacing: 8) {
-            filterPill("Show", icon: "eye")
-            filterPill("File Type", icon: "doc")
-            filterPill("File Size", icon: "scalemass")
-            filterPill("Date Modified", icon: "calendar")
+
+            // ── Show (recoverability score) ───────────────────────────────────
+            Menu {
+                Button("All") { filterScore = nil }
+                Divider()
+                ForEach([RecoverabilityScore.certain, .high, .medium, .low], id: \.self) { s in
+                    Button(action: { filterScore = s }) {
+                        HStack {
+                            Text(s.label)
+                            if filterScore == s {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                filterPillLabel(
+                    "Show",
+                    value:  filterScore?.label,
+                    active: filterScore != nil
+                )
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+
+            // ── File Type (category) ──────────────────────────────────────────
+            Menu {
+                Button("All Types") { filterCategory = nil }
+                Divider()
+                ForEach(FileCategory.allCases, id: \.self) { cat in
+                    let count = vm.summary?.group(for: cat)?.count ?? 0
+                    Button(action: { filterCategory = cat }) {
+                        HStack {
+                            Text("\(cat.rawValue) (\(count))")
+                            if filterCategory == cat {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                    .disabled(count == 0)
+                }
+            } label: {
+                filterPillLabel(
+                    "File Type",
+                    value:  filterCategory?.rawValue,
+                    active: filterCategory != nil
+                )
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+
+            // ── File Size ─────────────────────────────────────────────────────
+            Menu {
+                Button("Any Size") { filterSizeRange = nil }
+                Divider()
+                ForEach(FilterSizeRange.allCases) { range in
+                    Button(action: { filterSizeRange = range }) {
+                        HStack {
+                            Text(range.rawValue)
+                            if filterSizeRange == range {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                filterPillLabel(
+                    "File Size",
+                    value:  filterSizeRange?.rawValue,
+                    active: filterSizeRange != nil
+                )
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+
+            // ── Date Modified ─────────────────────────────────────────────────
+            Menu {
+                Button("Any Date") { filterDateRange = nil }
+                Divider()
+                ForEach(FilterDateRange.allCases) { range in
+                    Button(action: { filterDateRange = range }) {
+                        HStack {
+                            Text(range.rawValue)
+                            if filterDateRange == range {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                filterPillLabel(
+                    "Date Modified",
+                    value:  filterDateRange?.rawValue,
+                    active: filterDateRange != nil
+                )
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+
             Spacer()
-            if !searchText.isEmpty {
-                Button("Clear all") { searchText = "" }
-                    .font(.caption)
-                    .foregroundStyle(.mrTeal)
+
+            // Result count
+            Text("\(displayedCandidates.count) file\(displayedCandidates.count == 1 ? "" : "s")")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            // Clear all
+            if isAnyFilterActive {
+                Button(action: clearAllFilters) {
+                    Label("Clear", systemImage: "xmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.mrRose)
+                }
+                .buttonStyle(.plain)
+                .transition(.opacity.combined(with: .scale))
             }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 7)
         .background(Color.mrSurface)
+        .overlay(alignment: .bottom) {
+            Divider()
+        }
+        .animation(.spring(response: 0.2), value: isAnyFilterActive)
     }
 
-    private func filterPill(_ label: String, icon: String) -> some View {
+    private func filterPillLabel(_ title: String,
+                                  value: String?,
+                                  active: Bool) -> some View {
         HStack(spacing: 4) {
-            Text(label)
-                .font(.caption)
+            Text(value ?? title)
+                .font(.caption.weight(active ? .semibold : .regular))
             Image(systemName: "chevron.down")
                 .font(.system(size: 8, weight: .semibold))
         }
-        .foregroundStyle(.primary)
+        .foregroundStyle(active ? Color.mrTeal : Color.primary)
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
-        .background(Color.mrSurface)
+        .background(active ? Color.mrTeal.opacity(0.10) : Color.mrSurface)
         .clipShape(Capsule())
-        .overlay(Capsule().stroke(Color.mrBorder, lineWidth: 0.5))
+        .overlay(
+            Capsule().stroke(
+                active ? Color.mrTeal.opacity(0.45) : Color.mrBorder,
+                lineWidth: active ? 1 : 0.5
+            )
+        )
+        .animation(.spring(response: 0.2), value: active)
     }
 
     // MARK: - Left sidebar
