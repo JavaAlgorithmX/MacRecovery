@@ -110,13 +110,25 @@ final class ScanViewModel: ObservableObject {
     // MARK: - Scan lifecycle
 
     func startScan() {
-        guard let devicePath = effectiveDevicePath else { return }
+        guard let rawPath = effectiveDevicePath else { return }
+
+        // Partition nodes (e.g. /dev/disk6s1) may not support DKIOCGETBLOCKCOUNT
+        // on all controller types (USB, FDisk scheme, etc.). Use the whole-disk
+        // node (/dev/disk6) for raw sector scanning — it always supports the ioctls.
+        // Disk image paths (not starting with /dev/) are left unchanged.
+        let devicePath: String = {
+            guard rawPath.hasPrefix("/dev/"),
+                  let r = rawPath.range(of: #"s\d+$"#, options: .regularExpression)
+            else { return rawPath }
+            return String(rawPath[..<r.lowerBound])
+        }()
+
         showScanOptions = false
         appPhase        = .scanning
         scanError       = nil
         progress        = nil
         result          = nil
-        print("[ViewModel] startScan → device=\(devicePath) mode=\(scanMode.rawValue)")
+        print("[ViewModel] startScan → raw=\(rawPath) scanPath=\(devicePath) mode=\(scanMode.rawValue)")
 
         var config         = ScanConfiguration()
         config.mode        = scanMode
