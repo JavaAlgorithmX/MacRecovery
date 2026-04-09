@@ -84,16 +84,46 @@ final class ScanViewModel: ObservableObject {
 
     // MARK: - Permission check
 
-    /// Probes /dev/rdisk0 to determine if Full Disk Access has been granted.
-    /// EACCES / EPERM  → no FDA.  Success or any other errno → FDA granted.
-    func checkPermission() {
-        let fd = open("/dev/rdisk0", O_RDONLY | O_NONBLOCK)
-        if fd >= 0 {
-            close(fd)
-            hasFullDiskAccess = true
-        } else {
-            hasFullDiskAccess = (errno != EACCES && errno != EPERM)
+    /// Probes multiple FDA-gated paths to determine if Full Disk Access is granted.
+    /// Returns true if any probe succeeds or returns a non-permission errno.
+    @discardableResult
+    func checkPermission() -> Bool {
+        // Primary: raw disk nodes (what we actually need to scan)
+        // Try rdisk1 and rdisk2 first — less likely to be locked by the OS
+        // than rdisk0 (startup disk), which can return EPERM even with FDA.
+        let rawPaths = ["/dev/rdisk1", "/dev/rdisk2", "/dev/rdisk0"]
+        for path in rawPaths {
+            let fd = open(path, O_RDONLY | O_NONBLOCK)
+            if fd >= 0 {
+                close(fd)
+                hasFullDiskAccess = true
+                return true
+            }
+            // EBUSY / ENOENT / ENXIO = device exists but busy or absent — FDA is granted
+            if errno != EACCES && errno != EPERM {
+                hasFullDiskAccess = true
+                return true
+            }
         }
+        // Secondary: TCC database — only readable with Full Disk Access
+        let tccPaths = [
+            "/Library/Application Support/com.apple.TCC/TCC.db",
+            "/private/var/db/locationd/clients.plist"
+        ]
+        for path in tccPaths {
+            let fd = open(path, O_RDONLY)
+            if fd >= 0 {
+                close(fd)
+                hasFullDiskAccess = true
+                return true
+            }
+            if errno != EACCES && errno != EPERM {
+                hasFullDiskAccess = true
+                return true
+            }
+        }
+        hasFullDiskAccess = false
+        return false
     }
 
     // MARK: - Drive listing

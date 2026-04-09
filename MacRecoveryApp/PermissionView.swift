@@ -9,7 +9,11 @@ struct PermissionView: View {
     @EnvironmentObject var vm: ScanViewModel
 
     // Pulse animation for the lock icon
-    @State private var pulse = false
+    @State private var pulse        = false
+    // Set to true when user clicked "Check Again" but check still failed
+    @State private var needsRestart = false
+    // Brief "checking…" feedback while probe runs
+    @State private var isChecking   = false
 
     var body: some View {
         ZStack {
@@ -21,7 +25,6 @@ struct PermissionView: View {
 
                 // MARK: Icon cluster
                 ZStack {
-                    // Glowing ring
                     Circle()
                         .fill(Color.mrAmber.opacity(0.12))
                         .frame(width: 110, height: 110)
@@ -40,7 +43,6 @@ struct PermissionView: View {
                             value: pulse
                         )
 
-                    // Lock icon
                     Image(systemName: "lock.shield.fill")
                         .font(.system(size: 54, weight: .light))
                         .foregroundStyle(
@@ -60,7 +62,6 @@ struct PermissionView: View {
                     .multilineTextAlignment(.center)
                     .padding(.bottom, 10)
 
-                // MARK: Body
                 Text("MacRecovery reads raw disk sectors to recover deleted files.\nmacOS requires Full Disk Access to allow this.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
@@ -92,11 +93,33 @@ struct PermissionView: View {
                         .stroke(Color.mrBorder, lineWidth: 0.5)
                 )
                 .frame(maxWidth: 440)
-                .padding(.bottom, 28)
+                .padding(.bottom, needsRestart ? 16 : 28)
+
+                // MARK: Restart hint (shown after a failed "Check Again")
+                if needsRestart {
+                    HStack(spacing: 10) {
+                        Image(systemName: "arrow.counterclockwise.circle.fill")
+                            .foregroundStyle(Color.mrAmber)
+                        Text("macOS requires MacRecovery to **restart** before the new permission takes effect.")
+                            .font(.caption)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(Color.mrAmber.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.mrAmber.opacity(0.25), lineWidth: 1)
+                    )
+                    .frame(maxWidth: 440)
+                    .padding(.bottom, 20)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
 
                 // MARK: Buttons
                 HStack(spacing: 12) {
-                    // Open System Settings — deep-links straight to Full Disk Access
+                    // Open System Settings
                     Button(action: openPrivacySettings) {
                         HStack(spacing: 6) {
                             Image(systemName: "gearshape.fill")
@@ -108,21 +131,44 @@ struct PermissionView: View {
                     .tint(.mrAmber)
                     .controlSize(.large)
 
-                    // Re-check without restarting the app
-                    Button(action: vm.checkPermission) {
-                        HStack(spacing: 6) {
-                            Image(systemName: "arrow.clockwise")
-                            Text("Check Again")
+                    if needsRestart {
+                        // Relaunch the app so TCC takes effect
+                        Button(action: relaunchApp) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "arrow.counterclockwise")
+                                Text("Relaunch App")
+                            }
+                            .frame(width: 140)
                         }
-                        .frame(width: 140)
+                        .buttonStyle(.borderedProminent)
+                        .tint(Color(red: 0.35, green: 0.65, blue: 1.0))
+                        .controlSize(.large)
+                        .transition(.opacity)
+                    } else {
+                        // Check again without restarting
+                        Button(action: checkAgain) {
+                            HStack(spacing: 6) {
+                                if isChecking {
+                                    ProgressView()
+                                        .scaleEffect(0.7)
+                                        .tint(.primary)
+                                } else {
+                                    Image(systemName: "arrow.clockwise")
+                                }
+                                Text(isChecking ? "Checking…" : "Check Again")
+                            }
+                            .frame(width: 140)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.large)
+                        .disabled(isChecking)
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.large)
                 }
+                .animation(.easeInOut(duration: 0.2), value: needsRestart)
 
                 Spacer()
 
-                // MARK: Footer note
+                // MARK: Footer
                 Text("Tip: you can also open a disk image (.dmg / .img) without Full Disk Access — use the sidebar option on the next screen.")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
@@ -133,18 +179,50 @@ struct PermissionView: View {
             .padding(.horizontal, 60)
         }
         .onAppear { pulse = true }
-        // Re-check automatically when user switches back to the app
+        // Re-check automatically when user switches back from System Settings
         .onReceive(
             NotificationCenter.default.publisher(
                 for: NSApplication.didBecomeActiveNotification
             )
-        ) { _ in vm.checkPermission() }
+        ) { _ in
+            // Only auto-check if we haven't already determined a restart is needed
+            guard !needsRestart else { return }
+            _ = vm.checkPermission()
+        }
+    }
+
+    // MARK: - Actions
+
+    private func checkAgain() {
+        isChecking = true
+        // Small delay so the spinner is visible and TCC has a moment to settle
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            let granted = vm.checkPermission()
+            isChecking = false
+            if !granted {
+                // Permission still denied — macOS probably needs a restart
+                withAnimation { needsRestart = true }
+            }
+        }
     }
 
     private func openPrivacySettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    private func relaunchApp() {
+        guard let bundlePath = Bundle.main.bundlePath
+            .addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+              let url = URL(string: "file://\(bundlePath)")
+        else { return }
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        task.arguments     = ["-n", url.path]
+        try? task.run()
+        NSApp.terminate(nil)
     }
 }
 
@@ -156,7 +234,6 @@ private struct PermissionStep: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            // Numbered circle
             ZStack {
                 Circle()
                     .fill(Color.mrAmber.opacity(0.18))
@@ -165,7 +242,6 @@ private struct PermissionStep: View {
                     .font(.system(size: 11, weight: .bold))
                     .foregroundStyle(Color.mrAmber)
             }
-
             Text(text)
                 .font(.subheadline)
                 .fixedSize(horizontal: false, vertical: true)
