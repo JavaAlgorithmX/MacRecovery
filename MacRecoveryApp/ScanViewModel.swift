@@ -167,6 +167,14 @@ final class ScanViewModel: ObservableObject {
         progress        = nil
         result          = nil
 
+        // If FDA is not available, use the CLI backend with admin privileges
+        // (AppleScript shows a native macOS password dialog — no code signing needed)
+        if !hasFullDiskAccess {
+            log(AppLog.scan, "no FDA — switching to elevated CLI scan path")
+            startElevatedScan(devicePath: devicePath)
+            return
+        }
+
         var config         = ScanConfiguration()
         config.mode        = scanMode
         config.targetTypes = targetTypes.isEmpty ? nil : targetTypes
@@ -192,7 +200,6 @@ final class ScanViewModel: ObservableObject {
             var lastLoggedPercent = -1
             for await p in stream {
                 self.progress = p
-                // Log every 10% to avoid flooding
                 let pct = Int(p.percent / 10) * 10
                 if pct != lastLoggedPercent {
                     lastLoggedPercent = pct
@@ -217,6 +224,84 @@ final class ScanViewModel: ObservableObject {
                 self.appPhase  = .driveSelection
             }
         }
+    }
+
+    // MARK: - Elevated scan (no FDA — uses CLI via AppleScript sudo prompt)
+
+    private func startElevatedScan(devicePath: String) {
+        // Find the recoverycli binary next to the running executable
+        let execDir  = URL(fileURLWithPath: executablePath).deletingLastPathComponent()
+        let cliPath  = execDir.appendingPathComponent("recoverycli").path
+        let outDir   = "/tmp/macrecovery_\(UUID().uuidString.prefix(8))"
+        let modeFlag = scanMode.rawValue
+
+        guard FileManager.default.fileExists(atPath: cliPath) else {
+            log(AppLog.scan, "❌ recoverycli not found at \(cliPath)", level: "ERROR")
+            scanError = "recoverycli binary not found at \(cliPath). Run 'swift build -c release' first."
+            appPhase  = .driveSelection
+            return
+        }
+
+        log(AppLog.scan, "elevated scan — cli=\(cliPath) device=\(devicePath) mode=\(modeFlag) output=\(outDir)")
+
+        // AppleScript runs the CLI as root via a native macOS password dialog
+        let cmd    = "\(cliPath) scan \(devicePath) --mode \(modeFlag) --output \(outDir)"
+        let script = "do shell script \"\(cmd)\" with administrator privileges"
+
+        scanTask = Task { [weak self] in
+            guard let self else { return }
+
+            // progress stays nil — ScanProgressView shows indeterminate state
+            log(AppLog.scan, "prompting for admin password via AppleScript")
+
+            let appleScript = NSAppleScript(source: script)
+            var appleError: NSDictionary?
+            appleScript?.executeAndReturnError(&appleError)
+
+            if let err = appleError {
+                let msg = (err[NSAppleScript.errorMessage] as? String) ?? "Unknown AppleScript error"
+                log(AppLog.scan, "❌ elevated scan failed: \(msg)", level: "ERROR")
+                // User cancelled the password dialog — go back silently
+                if msg.contains("(-128)") || msg.contains("User canceled") {
+                    log(AppLog.scan, "user cancelled admin prompt")
+                } else {
+                    self.scanError = msg
+                }
+                self.appPhase = .driveSelection
+                return
+            }
+
+            // CLI finished — load results.json
+            let resultsURL = URL(fileURLWithPath: outDir).appendingPathComponent("results.json")
+            guard FileManager.default.fileExists(atPath: resultsURL.path) else {
+                log(AppLog.scan, "❌ results.json not found at \(resultsURL.path)", level: "ERROR")
+                self.scanError = "Scan completed but no results file was written."
+                self.appPhase  = .driveSelection
+                return
+            }
+
+            do {
+                let data        = try Data(contentsOf: resultsURL)
+                let decoder     = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                let scanResult  = try decoder.decode(ScanResult.self, from: data)
+
+                self.result         = scanResult
+                self.candidateIndex = CandidateIndex(result: scanResult)
+                self.summary        = CategorySummary(candidates: scanResult.candidates)
+                self.appPhase       = .results
+                let duration = scanResult.duration.map { String(format: "%.1fs", $0) } ?? "?"
+                log(AppLog.scan, "✅ elevated scan complete — \(scanResult.candidates.count) candidates in \(duration)")
+            } catch {
+                log(AppLog.scan, "❌ failed to decode results.json: \(error.localizedDescription)", level: "ERROR")
+                self.scanError = "Could not read scan results: \(error.localizedDescription)"
+                self.appPhase  = .driveSelection
+            }
+        }
+    }
+
+    private var executablePath: String {
+        Bundle.main.executablePath ?? ProcessInfo.processInfo.arguments[0]
     }
 
     func cancelScan() {

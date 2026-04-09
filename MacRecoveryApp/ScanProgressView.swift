@@ -192,6 +192,30 @@ struct ScanProgressView: View {
     // MARK: - Main content (scanning animation)
 
     private var scanContent: some View {
+        // When progress is nil the scan is running via elevated CLI (admin password prompt)
+        if vm.progress == nil {
+            return AnyView(elevatedScanWaitingView)
+        }
+        return AnyView(normalScanContent)
+    }
+
+    private var elevatedScanWaitingView: some View {
+        VStack(spacing: 20) {
+            ProgressView()
+                .scaleEffect(1.5)
+                .tint(.mrTeal)
+            Text("Waiting for admin authorization…")
+                .font(.headline)
+                .foregroundStyle(.primary)
+            Text("A macOS password dialog will appear.\nEnter your admin password to start the scan.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var normalScanContent: some View {
         VStack(spacing: 0) {
             // "Select All" row
             HStack {
