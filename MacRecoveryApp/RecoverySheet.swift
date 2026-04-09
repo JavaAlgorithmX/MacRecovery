@@ -475,11 +475,17 @@ struct RecoverySheet: View {
     }
 
     private func startExtraction() {
-        guard let url = outputURL else { return }
+        log(AppLog.recovery, "startExtraction() called — \(candidates.count) candidates")
+        guard let url = outputURL else {
+            log(AppLog.recovery, "❌ startExtraction aborted — outputURL is nil", level: "ERROR")
+            return
+        }
         guard let device = vm.device else {
+            log(AppLog.recovery, "❌ startExtraction aborted — vm.device is nil (DiskDevice not open)", level: "ERROR")
             showDeviceError = true
             return
         }
+        log(AppLog.recovery, "extracting to: \(url.path)")
         extractVM.extract(candidates, device: device, to: url)
     }
 }

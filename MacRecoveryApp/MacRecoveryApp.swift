@@ -3,6 +3,13 @@ import SwiftUI
 @main
 struct MacRecoveryApp: App {
 
+    init() {
+        // Kick off file logger immediately so session header is written first
+        _ = FileLogger.shared
+        log(AppLog.general, "MacRecovery launched — pid=\(ProcessInfo.processInfo.processIdentifier)")
+        log(AppLog.general, "Log file: \(FileLogger.shared.logFilePath)")
+    }
+
     var body: some Scene {
         WindowGroup("MacRecovery") {
             ContentView()

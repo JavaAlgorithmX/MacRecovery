@@ -16,7 +16,11 @@ enum AppPhase {
 final class ScanViewModel: ObservableObject {
 
     // ── Navigation ────────────────────────────────────────────────────────────
-    @Published var appPhase: AppPhase = .driveSelection
+    @Published var appPhase: AppPhase = .driveSelection {
+        didSet {
+            log(AppLog.navigation, "appPhase: \(String(describing: oldValue)) → \(String(describing: appPhase))")
+        }
+    }
     @Published var showScanOptions  = false
 
     // ── Drive listing ─────────────────────────────────────────────────────────
@@ -26,12 +30,11 @@ final class ScanViewModel: ObservableObject {
     @Published var volumeError:    String?
 
     // ── Image-file mode (no FDA required) ─────────────────────────────────────
-    /// Set when the user opens a .dmg / .img file directly instead of a device.
     @Published var imageFileURL: URL?
 
     // ── Scan configuration ────────────────────────────────────────────────────
     @Published var scanMode:    ScanMode               = .both
-    @Published var targetTypes: Set<RecoveredFileType> = []   // empty = all types
+    @Published var targetTypes: Set<RecoveredFileType> = []
 
     // ── Live scan state ───────────────────────────────────────────────────────
     @Published var progress:  ScanProgress?
@@ -55,25 +58,19 @@ final class ScanViewModel: ObservableObject {
 
     // MARK: - Derived helpers
 
-    /// The device path that will actually be opened — image file or BSD path.
     var effectiveDevicePath: String? {
         imageFileURL?.path ?? selectedVolume?.bsdPath
     }
 
-    /// Display name shown in the scan-options sheet header.
     var effectiveDisplayName: String {
-        if let url = imageFileURL {
-            return url.lastPathComponent
-        }
+        if let url = imageFileURL { return url.lastPathComponent }
         return selectedVolume?.displayName ?? "Unknown"
     }
 
-    /// SF Symbol for the active source.
     var effectiveSymbol: String {
         imageFileURL != nil ? "doc.circle" : (selectedVolume?.category.symbolName ?? "externaldrive")
     }
 
-    /// Size string for the active source (image files: from file system).
     var effectiveSizeString: String? {
         if let url = imageFileURL,
            let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize {
@@ -84,28 +81,28 @@ final class ScanViewModel: ObservableObject {
 
     // MARK: - Permission check
 
-    /// Probes multiple FDA-gated paths to determine if Full Disk Access is granted.
-    /// Returns true if any probe succeeds or returns a non-permission errno.
     @discardableResult
     func checkPermission() -> Bool {
-        // Primary: raw disk nodes (what we actually need to scan)
-        // Try rdisk1 and rdisk2 first — less likely to be locked by the OS
-        // than rdisk0 (startup disk), which can return EPERM even with FDA.
+        log(AppLog.permission, "checkPermission() called")
+
         let rawPaths = ["/dev/rdisk1", "/dev/rdisk2", "/dev/rdisk0"]
         for path in rawPaths {
             let fd = open(path, O_RDONLY | O_NONBLOCK)
             if fd >= 0 {
                 close(fd)
+                log(AppLog.permission, "✅ FDA granted — opened \(path) successfully")
                 hasFullDiskAccess = true
                 return true
             }
-            // EBUSY / ENOENT / ENXIO = device exists but busy or absent — FDA is granted
-            if errno != EACCES && errno != EPERM {
+            let err = errno
+            log(AppLog.permission, "probe \(path) → errno=\(err) (\(String(cString: strerror(err))))")
+            if err != EACCES && err != EPERM {
+                log(AppLog.permission, "✅ FDA granted — \(path) returned non-permission errno (\(err))")
                 hasFullDiskAccess = true
                 return true
             }
         }
-        // Secondary: TCC database — only readable with Full Disk Access
+
         let tccPaths = [
             "/Library/Application Support/com.apple.TCC/TCC.db",
             "/private/var/db/locationd/clients.plist"
@@ -114,14 +111,20 @@ final class ScanViewModel: ObservableObject {
             let fd = open(path, O_RDONLY)
             if fd >= 0 {
                 close(fd)
+                log(AppLog.permission, "✅ FDA granted — secondary probe succeeded: \(path)")
                 hasFullDiskAccess = true
                 return true
             }
-            if errno != EACCES && errno != EPERM {
+            let err = errno
+            log(AppLog.permission, "secondary probe \(path) → errno=\(err) (\(String(cString: strerror(err))))")
+            if err != EACCES && err != EPERM {
+                log(AppLog.permission, "✅ FDA granted via secondary probe")
                 hasFullDiskAccess = true
                 return true
             }
         }
+
+        log(AppLog.permission, "❌ FDA not granted — all probes returned EACCES/EPERM", level: "WARN")
         hasFullDiskAccess = false
         return false
     }
@@ -129,12 +132,15 @@ final class ScanViewModel: ObservableObject {
     // MARK: - Drive listing
 
     func loadVolumes() {
+        log(AppLog.volumes, "loadVolumes() called")
         volumesLoading = true
         volumeError    = nil
         Task {
             do {
                 volumes = try VolumeEnumerator.listForUI()
+                log(AppLog.volumes, "✅ loaded \(volumes.count) volume(s): \(volumes.map(\.bsdPath).joined(separator: ", "))")
             } catch {
+                log(AppLog.volumes, "❌ loadVolumes failed: \(error.localizedDescription)", level: "ERROR")
                 volumeError = error.localizedDescription
             }
             volumesLoading = false
@@ -142,13 +148,14 @@ final class ScanViewModel: ObservableObject {
     }
 
     func selectVolume(_ vol: UIVolume) {
+        log(AppLog.navigation, "selectVolume: \(vol.bsdPath) (\(vol.displayName)) fs=\(vol.fsType.rawValue) size=\(vol.displaySize)")
         imageFileURL    = nil
         selectedVolume  = vol
         showScanOptions = true
     }
 
-    /// Open a disk image file (.dmg / .img / .iso) — no Full Disk Access needed.
     func openImageFile(_ url: URL) {
+        log(AppLog.navigation, "openImageFile: \(url.path)")
         selectedVolume  = nil
         imageFileURL    = url
         showScanOptions = true
@@ -157,12 +164,11 @@ final class ScanViewModel: ObservableObject {
     // MARK: - Scan lifecycle
 
     func startScan() {
-        guard let rawPath = effectiveDevicePath else { return }
+        guard let rawPath = effectiveDevicePath else {
+            log(AppLog.scan, "❌ startScan() called with no device path", level: "ERROR")
+            return
+        }
 
-        // Partition nodes (e.g. /dev/disk6s1) may not support DKIOCGETBLOCKCOUNT
-        // on all controller types (USB, FDisk scheme, etc.). Use the whole-disk
-        // node (/dev/disk6) for raw sector scanning — it always supports the ioctls.
-        // Disk image paths (not starting with /dev/) are left unchanged.
         let devicePath: String = {
             guard rawPath.hasPrefix("/dev/"),
                   let r = rawPath.range(of: #"s\d+$"#, options: .regularExpression)
@@ -170,12 +176,13 @@ final class ScanViewModel: ObservableObject {
             return String(rawPath[..<r.lowerBound])
         }()
 
+        log(AppLog.scan, "startScan() — raw=\(rawPath) → scanPath=\(devicePath) mode=\(scanMode.rawValue) types=\(targetTypes.isEmpty ? "all" : targetTypes.map(\.rawValue).joined(separator: ","))")
+
         showScanOptions = false
         appPhase        = .scanning
         scanError       = nil
         progress        = nil
         result          = nil
-        print("[ViewModel] startScan → raw=\(rawPath) scanPath=\(devicePath) mode=\(scanMode.rawValue)")
 
         var config         = ScanConfiguration()
         config.mode        = scanMode
@@ -187,14 +194,27 @@ final class ScanViewModel: ObservableObject {
         scanTask = Task { [weak self] in
             guard let self else { return }
 
-            self.device          = try? DiskDevice.open(path: devicePath)
-            self.previewProvider = self.device.map { RecoveryCore.PreviewProvider(device: $0) }
+            // Open device for preview
+            if let dev = try? DiskDevice.open(path: devicePath) {
+                self.device          = dev
+                self.previewProvider = RecoveryCore.PreviewProvider(device: dev)
+                log(AppLog.device, "✅ DiskDevice opened for preview: \(devicePath) (\(dev.totalBytes) bytes, \(dev.totalSectors) sectors)")
+            } else {
+                log(AppLog.device, "⚠️ DiskDevice.open failed for preview — previewProvider will be nil", level: "WARN")
+            }
 
             let (stream, task) = engine.scanStream(devicePath: devicePath)
+            log(AppLog.scan, "scan stream started")
 
+            var lastLoggedPercent = -1
             for await p in stream {
                 self.progress = p
-                print("[ViewModel] progress: \(p.phase.rawValue) \(Int(p.percent))% sector=\(p.currentSector) candidates=\(p.candidateCount)")
+                // Log every 10% to avoid flooding
+                let pct = Int(p.percent / 10) * 10
+                if pct != lastLoggedPercent {
+                    lastLoggedPercent = pct
+                    log(AppLog.scan, "progress: phase=\(p.phase.rawValue) \(Int(p.percent))% sector=\(p.currentSector) candidates=\(p.candidateCount) speed=\(String(format:"%.1f",p.speed))MB/s")
+                }
             }
 
             do {
@@ -203,12 +223,13 @@ final class ScanViewModel: ObservableObject {
                 self.candidateIndex = CandidateIndex(result: scanResult)
                 self.summary        = CategorySummary(candidates: scanResult.candidates)
                 self.appPhase       = .results
-                print("[ViewModel] Scan complete → \(scanResult.candidates.count) files, navigating to results")
+                let duration = scanResult.duration.map { String(format: "%.1fs", $0) } ?? "?"
+                log(AppLog.scan, "✅ scan complete — \(scanResult.candidates.count) candidates in \(duration), bad sectors=\(scanResult.badSectors.count)")
             } catch is CancellationError {
-                print("[ViewModel] Scan cancelled")
+                log(AppLog.scan, "scan cancelled by user")
                 self.appPhase = .driveSelection
             } catch {
-                print("[ViewModel] Scan error: \(error)")
+                log(AppLog.scan, "❌ scan error: \(error.localizedDescription)", level: "ERROR")
                 self.scanError = error.localizedDescription
                 self.appPhase  = .driveSelection
             }
@@ -216,28 +237,29 @@ final class ScanViewModel: ObservableObject {
     }
 
     func cancelScan() {
+        log(AppLog.scan, "cancelScan() called")
         scanTask?.cancel()
         activeEngine?.cancel()
         appPhase = .driveSelection
     }
 
-    func pauseScan() { activeEngine?.requestPause() }
+    func pauseScan() {
+        log(AppLog.scan, "pauseScan() called")
+        activeEngine?.requestPause()
+    }
 
     func resetToStart() {
-        // Scan output
-        result         = nil
-        progress       = nil
-        candidateIndex = nil
-        summary        = nil
-        // Drive selection — clear so picker shows no stale highlight
+        log(AppLog.navigation, "resetToStart() — clearing scan state and returning to drive picker")
+        result          = nil
+        progress        = nil
+        candidateIndex  = nil
+        summary         = nil
         selectedVolume  = nil
         imageFileURL    = nil
-        // Release open file descriptors from previous scan
         device          = nil
         previewProvider = nil
-        // Reset scan config to defaults
-        scanMode    = .both
-        targetTypes = []
-        appPhase    = .driveSelection
+        scanMode        = .both
+        targetTypes     = []
+        appPhase        = .driveSelection
     }
 }
