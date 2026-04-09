@@ -301,6 +301,132 @@ final class SignatureScannerTests: XCTestCase {
     }
 }
 
+// MARK: - ClaimedRangesTests
+
+/// Tests for RecoveryEngine.isInClaimedRanges(_:ranges:), which replaced the
+/// old Set<UInt64> approach to avoid O(total_sectors) memory allocation.
+final class ClaimedRangesTests: XCTestCase {
+
+    // MARK: Correctness
+
+    func testEmptyRangesReturnsFalse() {
+        XCTAssertFalse(RecoveryEngine.isInClaimedRanges(0,   ranges: []))
+        XCTAssertFalse(RecoveryEngine.isInClaimedRanges(100, ranges: []))
+    }
+
+    func testSectorBeforeAllRanges() {
+        let ranges: [Range<UInt64>] = [10..<20]
+        XCTAssertFalse(RecoveryEngine.isInClaimedRanges(9, ranges: ranges))
+    }
+
+    func testSectorAtExactStart() {
+        let ranges: [Range<UInt64>] = [10..<20]
+        XCTAssertTrue(RecoveryEngine.isInClaimedRanges(10, ranges: ranges))
+    }
+
+    func testSectorInMiddleOfRange() {
+        let ranges: [Range<UInt64>] = [10..<20]
+        XCTAssertTrue(RecoveryEngine.isInClaimedRanges(15, ranges: ranges))
+    }
+
+    func testSectorAtExclusiveEnd() {
+        // Range is half-open: 10..<20 does NOT include 20
+        let ranges: [Range<UInt64>] = [10..<20]
+        XCTAssertFalse(RecoveryEngine.isInClaimedRanges(20, ranges: ranges))
+    }
+
+    func testSectorBetweenTwoRanges() {
+        let ranges: [Range<UInt64>] = [10..<20, 30..<40]
+        XCTAssertFalse(RecoveryEngine.isInClaimedRanges(25, ranges: ranges))
+    }
+
+    func testSectorInSecondRange() {
+        let ranges: [Range<UInt64>] = [10..<20, 30..<40]
+        XCTAssertTrue(RecoveryEngine.isInClaimedRanges(35, ranges: ranges))
+    }
+
+    func testSectorAfterAllRanges() {
+        let ranges: [Range<UInt64>] = [10..<20, 30..<40]
+        XCTAssertFalse(RecoveryEngine.isInClaimedRanges(999, ranges: ranges))
+    }
+
+    func testAdjacentRanges() {
+        // 0..<10 and 10..<20 are adjacent — sector 10 is in the second range only
+        let ranges: [Range<UInt64>] = [0..<10, 10..<20]
+        XCTAssertTrue(RecoveryEngine.isInClaimedRanges(9,  ranges: ranges))
+        XCTAssertTrue(RecoveryEngine.isInClaimedRanges(10, ranges: ranges))
+        XCTAssertTrue(RecoveryEngine.isInClaimedRanges(19, ranges: ranges))
+        XCTAssertFalse(RecoveryEngine.isInClaimedRanges(20, ranges: ranges))
+    }
+
+    func testManyRanges() {
+        // Build 1000 non-overlapping ranges of width 10, separated by gaps of 10
+        let ranges = (0..<1000).map { i -> Range<UInt64> in
+            let base = UInt64(i) * 20
+            return base..<(base + 10)
+        }
+        // Inside every range
+        XCTAssertTrue(RecoveryEngine.isInClaimedRanges(0,    ranges: ranges))
+        XCTAssertTrue(RecoveryEngine.isInClaimedRanges(9,    ranges: ranges))
+        XCTAssertTrue(RecoveryEngine.isInClaimedRanges(5005, ranges: ranges))  // range 250+
+        // In every gap
+        XCTAssertFalse(RecoveryEngine.isInClaimedRanges(10,  ranges: ranges))
+        XCTAssertFalse(RecoveryEngine.isInClaimedRanges(19,  ranges: ranges))
+        XCTAssertFalse(RecoveryEngine.isInClaimedRanges(19999, ranges: ranges))
+    }
+
+    // MARK: Memory safety (the bug this fixes)
+
+    /// The old code did `Set(candidates.flatMap { Array($0.startSector..<$0.endSector) })`.
+    /// For a 1 GB file at 512B/sector that's ~2M UInt64 values (~16 MB) per candidate.
+    /// This test verifies the new path completes instantly with negligible memory,
+    /// even for candidates that span millions of sectors.
+    func testLargeSectorCountDoesNotExhaustMemory() {
+        // Simulate 10 "files" each 1 GB in size (2,097,152 sectors at 512B)
+        let sectorsPerGB: UInt64 = 2_097_152
+        let candidates = (0..<10).map { i -> FileCandidate in
+            let start = UInt64(i) * sectorsPerGB * 2   // non-overlapping
+            return FileCandidate.fromCarving(
+                fileType:      .mp4,
+                startSector:   start,
+                sectorCount:   sectorsPerGB,
+                estimatedSize: 1_073_741_824
+            )
+        }
+
+        let ranges = candidates
+            .filter { $0.sectorCount > 0 }
+            .map    { $0.startSector..<$0.endSector }
+            .sorted { $0.lowerBound < $1.lowerBound }
+
+        // Spot-check a sector in the middle of each candidate — all must be claimed
+        for (i, c) in candidates.enumerated() {
+            let mid = c.startSector + sectorsPerGB / 2
+            XCTAssertTrue(
+                RecoveryEngine.isInClaimedRanges(mid, ranges: ranges),
+                "Sector in candidate \(i) should be claimed"
+            )
+        }
+        // A sector in the gap between candidates must not be claimed
+        let gap = candidates[0].endSector + 1
+        XCTAssertFalse(RecoveryEngine.isInClaimedRanges(gap, ranges: ranges))
+    }
+
+    // MARK: Performance
+
+    func testLookupPerformanceWith10kRanges() {
+        let ranges = (0..<10_000).map { i -> Range<UInt64> in
+            let base = UInt64(i) * 1000
+            return base..<(base + 500)
+        }
+        measure {
+            for sector in stride(from: UInt64(0), to: 10_000_000, by: 7) {
+                _ = RecoveryEngine.isInClaimedRanges(sector, ranges: ranges)
+            }
+        }
+    }
+}
+
 // MARK: - APFS TestFixtures
 
 extension TestFixtures {

@@ -143,7 +143,7 @@ public final class PreviewProvider {
 
         // ── Video: thumbnail from first-frame extraction ─────────────────────
         case .mp4, .mov, .avi, .mkv:
-            if let thumb = makeVideoThumbnail(data: data) { return .thumbnail(thumb) }
+            if let thumb = makeVideoThumbnail(data: data, type: type) { return .thumbnail(thumb) }
             return .hex(data.prefix(256))
 
         // ── Audio: hex dump of header ────────────────────────────────────────
@@ -198,10 +198,12 @@ public final class PreviewProvider {
 
     /// Extract the first video frame from in-memory data via AVFoundation.
     /// Returns a PNG-encoded thumbnail or nil if extraction fails.
-    private func makeVideoThumbnail(data: Data) -> Data? {
-        // Write data to a temp file — AVFoundation requires a URL-based asset
+    private func makeVideoThumbnail(data: Data, type: RecoveredFileType) -> Data? {
+        // Write data to a temp file — AVFoundation requires a URL-based asset.
+        // Use the correct extension so AVFoundation can pick the right demuxer.
+        let ext = type.fileExtension
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
-            .appendingPathComponent("macrecovery_preview_\(UUID().uuidString).dat")
+            .appendingPathComponent("macrecovery_preview_\(UUID().uuidString).\(ext)")
         do {
             try data.write(to: tmp)
             defer { try? FileManager.default.removeItem(at: tmp) }

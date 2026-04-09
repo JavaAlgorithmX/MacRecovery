@@ -552,10 +552,14 @@ public final class APFSParser {
             let ext     = (name as NSString).pathExtension.lowercased()
             let type    = RecoveredFileType.from(extension: ext)
 
-            // Convert block address to sector; use 0 if unknown
-            let startSector = inode.blockAddr > 0 ?
-                inode.blockAddr * sectorsPerBlock : 0
-            let sectorCount = UInt64((inode.size + UInt64(blockSize) - 1) / UInt64(blockSize)) * sectorsPerBlock
+            // Only set sector location when we actually know the physical block address.
+            // blockAddr==0 means the parser couldn't determine the location (APFS extent
+            // trees are not yet walked). Using startSector=0/sectorCount=0 means extents=[]
+            // so the extractor will not attempt to read garbage from the start of the disk.
+            let knownLocation = inode.blockAddr > 0
+            let startSector = knownLocation ? inode.blockAddr * sectorsPerBlock : 0
+            let sectorCount = knownLocation ?
+                UInt64((inode.size + UInt64(blockSize) - 1) / UInt64(blockSize)) * sectorsPerBlock : 0
 
             // Convert nanoseconds to Date
             let modDate: Date? = inode.modTime > 0 ?
@@ -564,7 +568,7 @@ public final class APFSParser {
             let candidate = FileCandidate.fromInode(
                 fileType:         type,
                 startSector:      startSector,
-                sectorCount:      max(sectorCount, 1),
+                sectorCount:      sectorCount,
                 estimatedSize:    inode.size,
                 originalName:     name,
                 originalPath:     "/\(name)",
@@ -573,7 +577,7 @@ public final class APFSParser {
             onPath?("/\(name)")
             candidates.append(candidate)
 
-            if startSector > 0 {
+            if startSector > 0 && sectorCount > 0 {
                 sectorMap.mark(sector: startSector, as: .candidate)
             }
         }

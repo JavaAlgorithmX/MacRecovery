@@ -122,12 +122,22 @@ public final class RecoveryEngine {
     private var sectorMap:        SectorMap?
     private var startTime:        Date?
 
-    /// Set to true to request cancellation. The running task is also checked
-    /// via `Task.isCancelled` — callers should prefer `task.cancel()`.
-    private var _cancelRequested  = false
+    /// Serial queue protecting the two flag booleans below.
+    /// `cancel()` and `requestPause()` can be called from any thread (e.g. MainActor),
+    /// while the deep scan reads the flags from a detached Task — a plain Bool write
+    /// is a data race in Swift's memory model.
+    private let flagQueue = DispatchQueue(label: "com.macrecovery.engine.flags")
+    private var _cancelRequestedValue  = false
+    private var _pauseRequestedValue   = false
 
-    /// Set to true to request a pause at the next checkpoint in the deep scan.
-    private var _pauseRequested   = false
+    private var _cancelRequested: Bool {
+        get { flagQueue.sync { _cancelRequestedValue } }
+        set { flagQueue.sync { _cancelRequestedValue = newValue } }
+    }
+    private var _pauseRequested: Bool {
+        get { flagQueue.sync { _pauseRequestedValue } }
+        set { flagQueue.sync { _pauseRequestedValue = newValue } }
+    }
 
     public init(config: ScanConfiguration = .default) {
         self.config = config
@@ -414,7 +424,7 @@ public final class RecoveryEngine {
         let fsType = detectFileSystem(device)
         print("[QuickScan] Detected filesystem: \(fsType.rawValue)")
 
-        let pathCallback: (String) -> Void = { [self] path in
+        let pathCallback: (String) -> Void = { path in
             print("[QuickScan] Scanning: \(path)  (\(results.count) found so far)")
             onProgress?(ScanProgress(
                 phase: .quickScan, percent: 50,
@@ -475,8 +485,12 @@ public final class RecoveryEngine {
         // Build a sorted array of sector ranges already found by the quick scan.
         // Using ranges + binary search avoids materialising millions of individual
         // UInt64 values into a Set (a 1 GB file alone would produce ~2M entries).
+        // Exclude candidates whose location is unknown (startSector==0, sectorCount==0).
+        // Including startSector==0 would claim sector 0 and make deep scan skip it,
+        // and unknown-location candidates (e.g. APFS without extent data) must not
+        // block carving.
         let claimedRanges: [Range<UInt64>] = existingCandidates
-            .filter { $0.sectorCount > 0 }
+            .filter { $0.sectorCount > 0 && $0.startSector > 0 }
             .map    { $0.startSector..<$0.endSector }
             .sorted { $0.lowerBound < $1.lowerBound }
 
@@ -602,16 +616,35 @@ public final class RecoveryEngine {
     private func deduplicateCandidates(_ candidates: [FileCandidate]) -> [FileCandidate] {
         guard candidates.count > 1 else { return candidates }
 
+        // Sort by startSector so that all candidates in `kept` have startSector ≤ current.
+        // That makes the domination check: ∃ kept[i] where endSector ≥ candidate.endSector
+        // AND recoverability ≥ candidate.recoverability.
+        //
+        // We track the maximum endSector seen per recoverability level.
+        // A candidate is dominated when any level ≥ its own has a maxEnd ≥ its endSector.
+        // This reduces the inner loop from O(n) to O(|RecoverabilityScore levels|) = O(4).
         let sorted = candidates.sorted { $0.startSector < $1.startSector }
         var kept:   [FileCandidate] = []
+        var maxEnd: [RecoverabilityScore: UInt64] = [:]
 
         for candidate in sorted {
-            let dominated = kept.contains { existing in
-                existing.startSector <= candidate.startSector &&
-                existing.endSector   >= candidate.endSector   &&
-                existing.recoverability >= candidate.recoverability
+            // Skip zero-sector candidates (unknown location) — never dominated, always kept.
+            guard candidate.sectorCount > 0 else {
+                kept.append(candidate)
+                continue
             }
-            if !dominated { kept.append(candidate) }
+            var dominated = false
+            for (score, end) in maxEnd {
+                if score >= candidate.recoverability && end >= candidate.endSector {
+                    dominated = true
+                    break
+                }
+            }
+            if !dominated {
+                kept.append(candidate)
+                let prev = maxEnd[candidate.recoverability] ?? 0
+                maxEnd[candidate.recoverability] = max(prev, candidate.endSector)
+            }
         }
 
         return kept.sorted {

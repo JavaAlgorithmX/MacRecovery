@@ -1,4 +1,5 @@
 import Foundation
+import DiskArbitration
 import os.log
 
 private let log = Logger(subsystem: "com.macrecovery", category: "DiskDevice")
@@ -41,7 +42,9 @@ public final class DiskDevice {
         }
         fputs("[DiskDevice] open: \(path) → \(effectivePath)\n", stderr)
 
-        let fd = Darwin.open(effectivePath, O_RDONLY | O_NONBLOCK)
+        // O_NONBLOCK must NOT be used for raw disk devices — it causes ioctls
+        // (DKIOCGETBLOCKCOUNT etc.) to return ENOTTY on many USB controllers.
+        let fd = Darwin.open(effectivePath, O_RDONLY)
         guard fd >= 0 else {
             throw DiskError.openFailed(path: effectivePath, errno: errno)
         }
@@ -62,7 +65,7 @@ public final class DiskDevice {
         fputs("[DiskDevice] \(path) fileType=0x\(String(fileType, radix:16)) isDevice=\(isDevice)\n", stderr)
 
         if isDevice {
-            // Strategy 1: lseek(SEEK_END) — works on all device types without ioctls
+            // Strategy 1: lseek(SEEK_END) — works on some raw device nodes
             let seekSize = lseek(fd, 0, SEEK_END)
             lseek(fd, 0, SEEK_SET)
             fputs("[DiskDevice] lseek SEEK_END → \(seekSize)\n", stderr)
@@ -70,7 +73,7 @@ public final class DiskDevice {
             if seekSize > 0 {
                 totalBytes = UInt64(seekSize)
             } else {
-                // Strategy 2: IOKit ioctls (fallback for devices where lseek returns 0)
+                // Strategy 2: IOKit DK ioctls
                 var blockCount: UInt64 = 0
                 var blockSize:  UInt32 = 0
                 let r1 = ioctl(fd, _DKIOCGETBLOCKCOUNT, &blockCount)
@@ -79,8 +82,16 @@ public final class DiskDevice {
                 if r1 == 0, r2 == 0, blockCount > 0 {
                     totalBytes = blockCount * UInt64(blockSize)
                 } else {
-                    Darwin.close(fd)
-                    throw DiskError.ioctlFailed(path: path, errno: errno)
+                    // Strategy 3: DiskArbitration — the same API used by VolumeEnumerator.
+                    // Reliable on USB/exFAT external drives where lseek and DK ioctls both
+                    // return 0 / ENOTTY (e.g. PS5 external storage, SDXC cards).
+                    if let daBytes = diskArbitrationSize(rawPath: effectivePath), daBytes > 0 {
+                        fputs("[DiskDevice] DiskArbitration size → \(daBytes)\n", stderr)
+                        totalBytes = daBytes
+                    } else {
+                        Darwin.close(fd)
+                        throw DiskError.ioctlFailed(path: path, errno: errno)
+                    }
                 }
             }
         } else {
@@ -193,13 +204,34 @@ public final class DiskDevice {
     }
 
     /// Strip the partition suffix from a BSD device path.
-    /// "/dev/disk6s1" → "/dev/disk6",  "/dev/rdisk6s2" → "/dev/rdisk6"
+    /// "/dev/disk6s1"  → "/dev/disk6"
+    /// "/dev/rdisk6s2" → "/dev/rdisk6"
     /// Returns nil if the path has no partition suffix (already a whole-disk node).
-    private static func wholeDiskPath(_ path: String) -> String? {
+    static func wholeDiskPath(_ path: String) -> String? {
         guard let range = path.range(of: #"s\d+$"#, options: .regularExpression) else {
             return nil
         }
         return String(path[..<range.lowerBound])
+    }
+
+    /// Ask DiskArbitration for the media size of a raw device path.
+    /// `rawPath` should be the /dev/rdiskN or /dev/diskN form.
+    /// DA uses just the BSD name without /dev/ prefix and without the leading 'r'.
+    private static func diskArbitrationSize(rawPath: String) -> UInt64? {
+        // Convert "/dev/rdisk6s1" → "disk6s1", "/dev/rdisk6" → "disk6"
+        var bsdName = rawPath
+        if bsdName.hasPrefix("/dev/rdisk") {
+            bsdName = "disk" + String(bsdName.dropFirst("/dev/rdisk".count))
+        } else if bsdName.hasPrefix("/dev/disk") {
+            bsdName = String(bsdName.dropFirst("/dev/".count))
+        }
+
+        guard let session = DASessionCreate(kCFAllocatorDefault) else { return nil }
+        guard let disk    = DADiskCreateFromBSDName(kCFAllocatorDefault,
+                                                    session, bsdName) else { return nil }
+        guard let descRaw = DADiskCopyDescription(disk) else { return nil }
+        let desc = descRaw as NSDictionary
+        return (desc[kDADiskDescriptionMediaSizeKey] as? NSNumber)?.uint64Value
     }
 }
 
