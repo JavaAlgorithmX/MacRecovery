@@ -9,11 +9,13 @@ struct PermissionView: View {
     @EnvironmentObject var vm: ScanViewModel
 
     // Pulse animation for the lock icon
-    @State private var pulse        = false
+    @State private var pulse           = false
     // Set to true when user clicked "Check Again" but check still failed
-    @State private var needsRestart = false
+    @State private var needsRestart    = false
     // Brief "checking…" feedback while probe runs
-    @State private var isChecking   = false
+    @State private var isChecking      = false
+    // Debounce: track last auto-check time to avoid rapid-fire probes
+    @State private var lastAutoCheck   = Date.distantPast
 
     var body: some View {
         ZStack {
@@ -179,14 +181,18 @@ struct PermissionView: View {
             .padding(.horizontal, 60)
         }
         .onAppear { pulse = true }
-        // Re-check automatically when user switches back from System Settings
+        // Re-check automatically when user switches back from System Settings.
+        // Debounced to 2s so rapid app-activate events don't spam the log.
         .onReceive(
             NotificationCenter.default.publisher(
                 for: NSApplication.didBecomeActiveNotification
             )
         ) { _ in
-            // Only auto-check if we haven't already determined a restart is needed
-            guard !needsRestart else { return }
+            guard !needsRestart, !isChecking else { return }
+            let now = Date()
+            guard now.timeIntervalSince(lastAutoCheck) > 2.0 else { return }
+            lastAutoCheck = now
+            log(AppLog.permission, "app became active — auto re-checking FDA")
             _ = vm.checkPermission()
         }
     }

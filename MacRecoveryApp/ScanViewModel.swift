@@ -103,28 +103,11 @@ final class ScanViewModel: ObservableObject {
             }
         }
 
-        let tccPaths = [
-            "/Library/Application Support/com.apple.TCC/TCC.db",
-            "/private/var/db/locationd/clients.plist"
-        ]
-        for path in tccPaths {
-            let fd = open(path, O_RDONLY)
-            if fd >= 0 {
-                close(fd)
-                log(AppLog.permission, "✅ FDA granted — secondary probe succeeded: \(path)")
-                hasFullDiskAccess = true
-                return true
-            }
-            let err = errno
-            log(AppLog.permission, "secondary probe \(path) → errno=\(err) (\(String(cString: strerror(err))))")
-            if err != EACCES && err != EPERM {
-                log(AppLog.permission, "✅ FDA granted via secondary probe")
-                hasFullDiskAccess = true
-                return true
-            }
-        }
-
-        log(AppLog.permission, "❌ FDA not granted — all probes returned EACCES/EPERM", level: "WARN")
+        // NOTE: Do NOT use secondary file probes (TCC.db, locationd, etc.)
+        // Those paths can be readable without raw-device access, causing false
+        // positives where the permission screen is skipped but the scan still
+        // fails. Only raw disk nodes tell us if we can actually open /dev/rdisk*.
+        log(AppLog.permission, "❌ FDA not granted — all raw disk probes returned EACCES/EPERM. Add MacRecovery in System Settings → Privacy & Security → Full Disk Access.", level: "WARN")
         hasFullDiskAccess = false
         return false
     }
