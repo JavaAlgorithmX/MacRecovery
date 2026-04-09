@@ -8,11 +8,16 @@ struct ContentView: View {
         Group {
             switch vm.appPhase {
             case .driveSelection:
-                DrivePickerView()
-                    .transition(.asymmetric(
-                        insertion:  .opacity,
-                        removal:    .opacity.combined(with: .move(edge: .leading))
-                    ))
+                if vm.hasFullDiskAccess {
+                    DrivePickerView()
+                        .transition(.asymmetric(
+                            insertion:  .opacity,
+                            removal:    .opacity.combined(with: .move(edge: .leading))
+                        ))
+                } else {
+                    PermissionView()
+                        .transition(.opacity)
+                }
             case .scanning:
                 ScanProgressView()
                     .transition(.asymmetric(
@@ -40,12 +45,19 @@ struct ContentView: View {
         } message: {
             if let err = vm.scanError {
                 Text(err)
-                if err.lowercased().contains("permission") || err.lowercased().contains("operation not permitted") || err.lowercased().contains("eperm") || err.lowercased().contains("eacces") {
-                    Text("\n\nGo to System Settings → Privacy & Security → Full Disk Access and enable MacRecovery (or Terminal if running via CLI).")
+                if err.lowercased().contains("permission")
+                    || err.lowercased().contains("operation not permitted")
+                    || err.lowercased().contains("eperm")
+                    || err.lowercased().contains("eacces") {
+                    Text("\n\nGo to System Settings → Privacy & Security → Full Disk Access and enable MacRecovery.")
                 }
             }
         }
         .animation(.spring(response: 0.38, dampingFraction: 0.88), value: vm.appPhase)
-        .onAppear { vm.loadVolumes() }
+        .animation(.easeInOut(duration: 0.3), value: vm.hasFullDiskAccess)
+        .onAppear {
+            vm.checkPermission()
+            vm.loadVolumes()
+        }
     }
 }

@@ -46,6 +46,9 @@ final class ScanViewModel: ObservableObject {
     var device:          DiskDevice?
     var previewProvider: RecoveryCore.PreviewProvider?
 
+    // ── Permission ────────────────────────────────────────────────────────────
+    @Published var hasFullDiskAccess = false
+
     // ── Private ───────────────────────────────────────────────────────────────
     private var activeEngine: RecoveryEngine?
     private var scanTask:     Task<Void, Never>?
@@ -77,6 +80,20 @@ final class ScanViewModel: ObservableObject {
             return ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
         }
         return selectedVolume?.displaySize
+    }
+
+    // MARK: - Permission check
+
+    /// Probes /dev/rdisk0 to determine if Full Disk Access has been granted.
+    /// EACCES / EPERM  → no FDA.  Success or any other errno → FDA granted.
+    func checkPermission() {
+        let fd = open("/dev/rdisk0", O_RDONLY | O_NONBLOCK)
+        if fd >= 0 {
+            close(fd)
+            hasFullDiskAccess = true
+        } else {
+            hasFullDiskAccess = (errno != EACCES && errno != EPERM)
+        }
     }
 
     // MARK: - Drive listing

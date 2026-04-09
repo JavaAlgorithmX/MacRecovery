@@ -175,6 +175,11 @@ struct DrivePickerView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
 
+                    // Permission warning banner — shown if FDA was revoked mid-session
+                    if !vm.hasFullDiskAccess {
+                        permissionBanner
+                    }
+
                     if !externalVolumes.isEmpty {
                         volumeGroup(
                             title: "External Volume/Partition (\(externalVolumes.count))",
@@ -193,6 +198,41 @@ struct DrivePickerView: View {
                 .padding(.vertical, 20)
             }
         }
+    }
+
+    private var permissionBanner: some View {
+        HStack(spacing: 14) {
+            Image(systemName: "lock.shield.fill")
+                .font(.system(size: 22))
+                .foregroundStyle(Color.mrAmber)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Full Disk Access not granted")
+                    .font(.subheadline.weight(.semibold))
+                Text("Scanning raw devices requires Full Disk Access. Image files work without it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            Button("Fix…") {
+                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+            .buttonStyle(.bordered)
+            .tint(.mrAmber)
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(Color.mrAmber.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.mrAmber.opacity(0.25), lineWidth: 1)
+        )
     }
 
     private func volumeGroup(title: String, volumes: [UIVolume]) -> some View {
