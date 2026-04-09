@@ -17,6 +17,7 @@ struct RecoverySheet: View {
     @State private var selectedVolumeID: String?  = nil   // nil = use customURL
     @State private var customURL:         URL?     = nil
     @State private var localCloudTab:     Int      = 0    // 0 = Local, 1 = Cloud
+    @State private var showDeviceError    = false
 
     // MARK: - Resolved output URL
 
@@ -32,6 +33,12 @@ struct RecoverySheet: View {
     // Total size of queued candidates
     private var totalBytes: UInt64 {
         candidates.reduce(0) { $0 + $1.estimatedSize }
+    }
+
+    // True when the selected output volume is the same as the scan source
+    private var isRecoveringToSource: Bool {
+        guard let selectedID = selectedVolumeID else { return false }
+        return selectedID == vm.selectedVolume?.id
     }
 
     // MARK: - Body
@@ -52,6 +59,11 @@ struct RecoverySheet: View {
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .animation(.easeInOut(duration: 0.25), value: extractVM.isExtracting)
         .animation(.easeInOut(duration: 0.25), value: extractVM.isDone)
+        .alert("Device Unavailable", isPresented: $showDeviceError) {
+            Button("OK", role: .cancel) { }
+        } message: {
+            Text("The source device could not be opened. Please return to the drive picker and start a new scan.")
+        }
     }
 
     // MARK: ── Phase 1: Location picker ────────────────────────────────────────
@@ -101,7 +113,7 @@ struct RecoverySheet: View {
                 Button("Save", action: startExtraction)
                     .buttonStyle(.borderedProminent)
                     .tint(.mrTeal)
-                    .disabled(outputURL == nil)
+                    .disabled(outputURL == nil || isRecoveringToSource)
                     .keyboardShortcut(.defaultAction)
             }
             .padding(.horizontal, 28)
@@ -463,7 +475,11 @@ struct RecoverySheet: View {
     }
 
     private func startExtraction() {
-        guard let device = vm.device, let url = outputURL else { return }
+        guard let url = outputURL else { return }
+        guard let device = vm.device else {
+            showDeviceError = true
+            return
+        }
         extractVM.extract(candidates, device: device, to: url)
     }
 }

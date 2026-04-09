@@ -177,11 +177,20 @@ final class ScanViewModel: ObservableObject {
     func pauseScan() { activeEngine?.requestPause() }
 
     func resetToStart() {
+        // Scan output
         result         = nil
         progress       = nil
         candidateIndex = nil
         summary        = nil
-        imageFileURL   = nil
-        appPhase       = .driveSelection
+        // Drive selection — clear so picker shows no stale highlight
+        selectedVolume  = nil
+        imageFileURL    = nil
+        // Release open file descriptors from previous scan
+        device          = nil
+        previewProvider = nil
+        // Reset scan config to defaults
+        scanMode    = .both
+        targetTypes = []
+        appPhase    = .driveSelection
     }
 }
