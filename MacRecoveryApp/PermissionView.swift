@@ -80,8 +80,20 @@ struct PermissionView: View {
                     )
                     PermissionStep(
                         number: "2",
-                        text: "Click the **+** button and add **MacRecovery** (or **Terminal** if running via CLI)"
+                        text: "Click **+** and navigate to this exact binary:"
                     )
+                    // Show exact path so user adds the right binary
+                    Text(executablePath)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.mrTeal)
+                        .textSelection(.enabled)
+                        .lineLimit(3)
+                        .truncationMode(.middle)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(Color.mrTeal.opacity(0.07))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                        .padding(.leading, 36)
                     PermissionStep(
                         number: "3",
                         text: "Toggle it **on**, then return here and click **Check Again**"
@@ -212,6 +224,12 @@ struct PermissionView: View {
         }
     }
 
+    // The exact binary path — shown to user and used for relaunch
+    private var executablePath: String {
+        Bundle.main.executablePath
+            ?? ProcessInfo.processInfo.arguments[0]
+    }
+
     private func openPrivacySettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
             NSWorkspace.shared.open(url)
@@ -219,16 +237,19 @@ struct PermissionView: View {
     }
 
     private func relaunchApp() {
-        guard let bundlePath = Bundle.main.bundlePath
-            .addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
-              let url = URL(string: "file://\(bundlePath)")
-        else { return }
+        let path = executablePath
+        log(AppLog.permission, "relaunchApp() — relaunching: \(path)")
 
         let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        task.arguments     = ["-n", url.path]
-        try? task.run()
-        NSApp.terminate(nil)
+        task.executableURL = URL(fileURLWithPath: path)
+        task.arguments     = []
+        do {
+            try task.run()
+            log(AppLog.permission, "relaunch process spawned — terminating current instance")
+            NSApp.terminate(nil)
+        } catch {
+            log(AppLog.permission, "❌ relaunchApp failed: \(error.localizedDescription)", level: "ERROR")
+        }
     }
 }
 
