@@ -8,16 +8,11 @@ struct ContentView: View {
         Group {
             switch vm.appPhase {
             case .driveSelection:
-                if vm.hasFullDiskAccess {
-                    DrivePickerView()
-                        .transition(.asymmetric(
-                            insertion:  .opacity,
-                            removal:    .opacity.combined(with: .move(edge: .leading))
-                        ))
-                } else {
-                    PermissionView()
-                        .transition(.opacity)
-                }
+                DrivePickerView()
+                    .transition(.asymmetric(
+                        insertion:  .opacity,
+                        removal:    .opacity.combined(with: .move(edge: .leading))
+                    ))
             case .scanning:
                 ScanProgressView()
                     .transition(.asymmetric(
