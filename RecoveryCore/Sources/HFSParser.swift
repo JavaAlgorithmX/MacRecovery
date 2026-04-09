@@ -143,8 +143,10 @@ public final class HFSParser {
 
     // MARK: Private — Catalog B-tree location
 
-    /// The catalog fork data starts at volume header offset 248.
-    /// First extent's start block is at offset 248 + 16 (after logicalSize + totalBlocks).
+    /// The catalog fork data starts at volume header offset 272.
+    /// HFS+ VH layout: allocationFile(at 112, 80B) + extentsFile(at 192, 80B) = catalogFile at 272.
+    /// HFSPlusForkData layout: logicalSize(8) + clumpSize(4) + totalBlocks(4) + extents[0].startBlock(4)
+    /// So startBlock is at catalogForkOffset + 16.
     private static func readCatalogStartBlock(device: DiskDevice,
                                                blockSize: UInt32) throws -> UInt32 {
         let vhOffset = 1024
@@ -154,10 +156,10 @@ public final class HFSParser {
                                              into: nil) else {
             throw HFSError.cannotReadVolumeHeader
         }
-        // Catalog fork starts at fixed offset 248 within VH
-        // logicalSize (8) + clumpSize (4) + totalBlocks (4) + extents[0].startBlock (4)
-        let catalogForkOffset = vhOffset + 248
-        let startBlock = data.readBigEndianUInt32(at: catalogForkOffset + 20)
+        // Catalog fork is at VH offset 272 (after allocationFile and extentsFile, each 80 bytes)
+        // Within HFSPlusForkData: logicalSize(8) + clumpSize(4) + totalBlocks(4) = 16 → startBlock
+        let catalogForkOffset = vhOffset + 272
+        let startBlock = data.readBigEndianUInt32(at: catalogForkOffset + 16)
         return startBlock
     }
 

@@ -38,6 +38,10 @@ public final class SectorMap: @unchecked Sendable {
         self.sectorSize   = sectorSize
         self.map          = [UInt8](repeating: SectorState.unread.rawValue,
                                    count: Int(totalSectors))
+        // Running counters start at 0 — all sectors are initially .unread
+        self._scannedCount    = 0
+        self._badCount        = 0
+        self._candidateCount  = 0
     }
 
     // MARK: Read / write
@@ -49,14 +53,33 @@ public final class SectorMap: @unchecked Sendable {
 
     public func mark(sector: UInt64, as state: SectorState) {
         guard sector < totalSectors else { return }
-        queue.sync { map[Int(sector)] = state.rawValue }
+        queue.sync {
+            let old = SectorState(rawValue: map[Int(sector)]) ?? .unread
+            adjustCounters(from: old, to: state)
+            map[Int(sector)] = state.rawValue
+        }
     }
 
     public func mark(range: Range<UInt64>, as state: SectorState) {
         let clamped = range.clamped(to: 0..<totalSectors)
         queue.sync {
-            for i in clamped { map[Int(i)] = state.rawValue }
+            for i in clamped {
+                let old = SectorState(rawValue: map[Int(i)]) ?? .unread
+                adjustCounters(from: old, to: state)
+                map[Int(i)] = state.rawValue
+            }
         }
+    }
+
+    // Must be called inside `queue.sync`.
+    private func adjustCounters(from old: SectorState, to new: SectorState) {
+        if old == new { return }
+        if old != .unread  { _scannedCount   -= 1 }
+        if old == .badSector  { _badCount       -= 1 }
+        if old == .candidate  { _candidateCount -= 1 }
+        if new != .unread  { _scannedCount   += 1 }
+        if new == .badSector  { _badCount       += 1 }
+        if new == .candidate  { _candidateCount += 1 }
     }
 
     // MARK: Progress reporting
@@ -73,18 +96,10 @@ public final class SectorMap: @unchecked Sendable {
     }
 
     public func progress() -> Progress {
+        // O(1) — counters are maintained by mark() instead of scanning the full map.
         queue.sync {
-            var scanned:    UInt64 = 0
-            var bad:        UInt64 = 0
-            var candidates: UInt64 = 0
-            for byte in map {
-                let s = SectorState(rawValue: byte) ?? .unread
-                if s != .unread  { scanned    += 1 }
-                if s == .badSector  { bad       += 1 }
-                if s == .candidate  { candidates += 1 }
-            }
-            return Progress(scanned: scanned, total: totalSectors,
-                            badSectors: bad, candidates: candidates)
+            Progress(scanned: _scannedCount, total: totalSectors,
+                     badSectors: _badCount, candidates: _candidateCount)
         }
     }
 
@@ -124,7 +139,20 @@ public final class SectorMap: @unchecked Sendable {
                 expected: totalSectors, got: UInt64(data.count))
         }
         let m = SectorMap(totalSectors: totalSectors, sectorSize: sectorSize)
-        m.queue.sync { m.map = [UInt8](data) }
+        m.queue.sync {
+            m.map = [UInt8](data)
+            // Rebuild running counters from the loaded map.
+            var scanned: UInt64 = 0; var bad: UInt64 = 0; var candidates: UInt64 = 0
+            for byte in m.map {
+                let s = SectorState(rawValue: byte) ?? .unread
+                if s != .unread   { scanned    += 1 }
+                if s == .badSector   { bad        += 1 }
+                if s == .candidate   { candidates += 1 }
+            }
+            m._scannedCount   = scanned
+            m._badCount       = bad
+            m._candidateCount = candidates
+        }
         return m
     }
 
@@ -132,6 +160,12 @@ public final class SectorMap: @unchecked Sendable {
 
     private var map: [UInt8]
     private let queue = DispatchQueue(label: "com.macrecovery.sectormap")
+
+    // Running counters — updated by adjustCounters() on every mark() call.
+    // All access must be inside `queue.sync`.
+    private var _scannedCount:   UInt64
+    private var _badCount:       UInt64
+    private var _candidateCount: UInt64
 }
 
 // MARK: - Errors

@@ -30,6 +30,7 @@ func printUsage() {
       --output <directory>          Where to write recovered files (default: ./recovered)
       --min-score low|medium|high|certain
                                     Minimum recoverability to extract (default: medium)
+      --index <n>                   Recover only the Nth file shown by 'preview' (1-based)
 
     Preview options:
       --limit <n>                   Max candidates to preview (default: 20)
@@ -148,7 +149,7 @@ case "info":
     }
     do {
         let device = try DiskDevice.open(path: path)
-        let gb = Double(device.totalBytes) / 1_073_741_824
+        let gb = Double(device.totalBytes) / 1_000_000_000
         print("Path:         \(device.path)")
         print("Total bytes:  \(device.totalBytes) (\(String(format: "%.2f", gb)) GB)")
         print("Sector size:  \(device.sectorSize) bytes")
@@ -280,6 +281,7 @@ case "recover":
 
     var outputPath: String = "./recovered"
     var minScore: RecoverabilityScore = .medium
+    var recoverIndex: Int? = nil
 
     var i = 0
     while i < remainingArgs.count {
@@ -300,6 +302,14 @@ case "recover":
                     exit(1)
                 }
             }
+        case "--index":
+            i += 1
+            if i < remainingArgs.count, let n = Int(remainingArgs[i]), n >= 1 {
+                recoverIndex = n
+            } else {
+                fputs("--index requires a positive integer (1-based, matching 'preview' output).\n", stderr)
+                exit(1)
+            }
         default:
             break
         }
@@ -314,14 +324,26 @@ case "recover":
         decoder.dateDecodingStrategy = .iso8601
         let scanResult = try decoder.decode(ScanResult.self, from: jsonData)
 
-        let candidates = scanResult.candidates.filter { $0.recoverability >= minScore }
-        guard !candidates.isEmpty else {
-            print("No candidates meet the minimum recoverability score '\(minScore.label)'. Nothing to recover.")
-            exit(0)
+        // Build candidate list — same ordering as 'preview' so --index matches
+        let index = CandidateIndex(result: scanResult)
+        let allCandidates = index.search()
+
+        let candidates: [FileCandidate]
+        if let n = recoverIndex {
+            guard n <= allCandidates.count else {
+                fputs("--index \(n) is out of range (preview shows \(allCandidates.count) candidates).\n", stderr)
+                exit(1)
+            }
+            candidates = [allCandidates[n - 1]]
+            print("Recovering candidate #\(n): \(candidates[0].suggestedFileName)")
+        } else {
+            candidates = allCandidates.filter { $0.recoverability >= minScore }
+            guard !candidates.isEmpty else {
+                print("No candidates meet the minimum recoverability score '\(minScore.label)'. Nothing to recover.")
+                exit(0)
+            }
         }
 
-        print("Loaded \(scanResult.candidates.count) candidates from \(jsonPath)")
-        print("Extracting \(candidates.count) file(s) with score ≥ \(minScore.label) from \(scanResult.devicePath)...")
         print(String(repeating: "─", count: 70))
 
         let device    = try DiskDevice.open(path: scanResult.devicePath)
@@ -481,7 +503,9 @@ func printResult(_ result: ScanResult) {
 }
 
 func saveResult(_ result: ScanResult, to path: String) throws {
-    let url = URL(fileURLWithPath: path).appendingPathComponent("results.json")
+    let dir = URL(fileURLWithPath: path)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let url = dir.appendingPathComponent("results.json")
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     encoder.dateEncodingStrategy = .iso8601

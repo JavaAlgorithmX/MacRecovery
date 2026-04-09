@@ -110,12 +110,25 @@ final class ScanViewModel: ObservableObject {
     // MARK: - Scan lifecycle
 
     func startScan() {
-        guard let devicePath = effectiveDevicePath else { return }
+        guard let rawPath = effectiveDevicePath else { return }
+
+        // Partition nodes (e.g. /dev/disk6s1) may not support DKIOCGETBLOCKCOUNT
+        // on all controller types (USB, FDisk scheme, etc.). Use the whole-disk
+        // node (/dev/disk6) for raw sector scanning — it always supports the ioctls.
+        // Disk image paths (not starting with /dev/) are left unchanged.
+        let devicePath: String = {
+            guard rawPath.hasPrefix("/dev/"),
+                  let r = rawPath.range(of: #"s\d+$"#, options: .regularExpression)
+            else { return rawPath }
+            return String(rawPath[..<r.lowerBound])
+        }()
+
         showScanOptions = false
         appPhase        = .scanning
         scanError       = nil
         progress        = nil
         result          = nil
+        print("[ViewModel] startScan → raw=\(rawPath) scanPath=\(devicePath) mode=\(scanMode.rawValue)")
 
         var config         = ScanConfiguration()
         config.mode        = scanMode
@@ -132,7 +145,10 @@ final class ScanViewModel: ObservableObject {
 
             let (stream, task) = engine.scanStream(devicePath: devicePath)
 
-            for await p in stream { self.progress = p }
+            for await p in stream {
+                self.progress = p
+                print("[ViewModel] progress: \(p.phase.rawValue) \(Int(p.percent))% sector=\(p.currentSector) candidates=\(p.candidateCount)")
+            }
 
             do {
                 let scanResult      = try await task.value
@@ -140,9 +156,12 @@ final class ScanViewModel: ObservableObject {
                 self.candidateIndex = CandidateIndex(result: scanResult)
                 self.summary        = CategorySummary(candidates: scanResult.candidates)
                 self.appPhase       = .results
+                print("[ViewModel] Scan complete → \(scanResult.candidates.count) files, navigating to results")
             } catch is CancellationError {
+                print("[ViewModel] Scan cancelled")
                 self.appPhase = .driveSelection
             } catch {
+                print("[ViewModel] Scan error: \(error)")
                 self.scanError = error.localizedDescription
                 self.appPhase  = .driveSelection
             }

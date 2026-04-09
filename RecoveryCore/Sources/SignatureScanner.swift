@@ -266,14 +266,16 @@ public struct SignatureScanner {
             for i in 0..<maxSectors {
                 let sector = startSector + i
                 guard let sectorData = device.readSector(sector, into: sectorMap) else {
-                    continue  // bad sector — skip
+                    // Bad sector interrupts the file — the footer can't be past a gap.
+                    // Report what we have so far as a truncated/partial file.
+                    return (sectorCount: max(i, 1), recoverability: .low)
                 }
                 if sectorData.range(of: Data(footer)) != nil {
                     let recoverability: RecoverabilityScore = i < 10 ? .high : .medium
                     return (sectorCount: i + 1, recoverability: recoverability)
                 }
             }
-            // Footer not found — truncated file
+            // Footer not found within maxSize — truncated file
             return (sectorCount: maxSectors / 4, recoverability: .low)
         }
 

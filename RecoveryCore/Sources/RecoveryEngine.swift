@@ -122,12 +122,22 @@ public final class RecoveryEngine {
     private var sectorMap:        SectorMap?
     private var startTime:        Date?
 
-    /// Set to true to request cancellation. The running task is also checked
-    /// via `Task.isCancelled` — callers should prefer `task.cancel()`.
-    private var _cancelRequested  = false
+    /// Serial queue protecting the two flag booleans below.
+    /// `cancel()` and `requestPause()` can be called from any thread (e.g. MainActor),
+    /// while the deep scan reads the flags from a detached Task — a plain Bool write
+    /// is a data race in Swift's memory model.
+    private let flagQueue = DispatchQueue(label: "com.macrecovery.engine.flags")
+    private var _cancelRequestedValue  = false
+    private var _pauseRequestedValue   = false
 
-    /// Set to true to request a pause at the next checkpoint in the deep scan.
-    private var _pauseRequested   = false
+    private var _cancelRequested: Bool {
+        get { flagQueue.sync { _cancelRequestedValue } }
+        set { flagQueue.sync { _cancelRequestedValue = newValue } }
+    }
+    private var _pauseRequested: Bool {
+        get { flagQueue.sync { _pauseRequestedValue } }
+        set { flagQueue.sync { _pauseRequestedValue = newValue } }
+    }
 
     public init(config: ScanConfiguration = .default) {
         self.config = config
@@ -169,7 +179,11 @@ public final class RecoveryEngine {
         startTime        = Date()
         _cancelRequested = false
         _pauseRequested  = false
-        log.info("RecoveryEngine starting \(self.config.mode.rawValue) scan on \(devicePath)")
+
+        print("╔══ SCAN START ═══════════════════════════════════════")
+        print("║  Device : \(devicePath)")
+        print("║  Mode   : \(config.mode.rawValue)")
+        print("╚════════════════════════════════════════════════════")
 
         report(.opening, qp: 0, dp: 0, pct: 0, candidates: 0,
                bad: 0, sector: 0, callback: onProgress)
@@ -179,17 +193,20 @@ public final class RecoveryEngine {
                                sectorSize: device.sectorSize)
         self.sectorMap = map
 
+        print("[Engine] Device opened — \(device.totalBytes / 1_000_000_000) GB, \(device.totalSectors) sectors @ \(device.sectorSize)B")
+
         var allCandidates: [FileCandidate] = []
 
         // Quick scan
         if config.mode == .quick || config.mode == .both {
+            print("[Engine] ── Quick Scan starting ──────────────────────")
             report(.quickScan, qp: 0, dp: 0, pct: 2,
                    candidates: 0, bad: 0, sector: 0,
                    path: "Scanning \(devicePath)…", callback: onProgress)
             let quickResults = runQuickScan(device: device, map: map,
                                             onProgress: onProgress)
             allCandidates.append(contentsOf: quickResults)
-            log.info("Quick scan: \(quickResults.count) candidates")
+            print("[Engine] Quick scan done — \(quickResults.count) candidates")
         }
 
         // Check for cancellation between phases
@@ -197,6 +214,7 @@ public final class RecoveryEngine {
 
         // Deep scan
         if config.mode == .deep || config.mode == .both {
+            print("[Engine] ── Deep Scan starting ───────────────────────")
             let (deepResults, pausedAt) = try await runDeepScan(
                 device:             device,
                 map:                map,
@@ -205,10 +223,11 @@ public final class RecoveryEngine {
                 onProgress:         onProgress
             )
             allCandidates.append(contentsOf: deepResults)
-            log.info("Deep scan: \(deepResults.count) additional candidates")
+            print("[Engine] Deep scan done — \(deepResults.count) new candidates")
 
             // Paused mid-scan — save checkpoint and return partial result
             if let pausedSector = pausedAt {
+                print("[Engine] Scan paused at sector \(pausedSector)")
                 let cpURL = try saveCheckpoint(
                     devicePath:   devicePath,
                     resumeSector: pausedSector,
@@ -230,11 +249,20 @@ public final class RecoveryEngine {
         }
 
         // Organising phase — deduplicate and sort
+        print("[Engine] ── Organising \(allCandidates.count) total candidates ──────")
         report(.organising, qp: 100, dp: 100, pct: 98,
                candidates: allCandidates.count,
                bad: map.badSectors().count,
                sector: device.totalSectors, callback: onProgress)
         let organised = deduplicateCandidates(allCandidates)
+
+        let elapsed = Date().timeIntervalSince(startTime!)
+        print("╔══ SCAN COMPLETE ════════════════════════════════════")
+        print("║  Files found   : \(organised.count)")
+        print("║  Bad sectors   : \(map.badSectors().count)")
+        print("║  Sectors scanned: \(map.progress().scanned)")
+        print("║  Elapsed       : \(String(format: "%.1f", elapsed))s")
+        print("╚════════════════════════════════════════════════════")
 
         report(.complete, qp: 100, dp: 100, pct: 100,
                candidates: organised.count,
@@ -361,11 +389,11 @@ public final class RecoveryEngine {
     ) -> (stream: AsyncStream<ScanProgress>, task: Task<ScanResult, Error>) {
         var continuation: AsyncStream<ScanProgress>.Continuation!
         let stream = AsyncStream<ScanProgress> { cont in continuation = cont }
-        let task = Task {
+        let task = Task.detached {
+            defer { continuation.finish() }
             let result = try await self.scan(devicePath: devicePath) { progress in
                 continuation.yield(progress)
             }
-            continuation.finish()
             return result
         }
         return (stream, task)
@@ -377,11 +405,11 @@ public final class RecoveryEngine {
     ) -> (stream: AsyncStream<ScanProgress>, task: Task<ScanResult, Error>) {
         var continuation: AsyncStream<ScanProgress>.Continuation!
         let stream = AsyncStream<ScanProgress> { cont in continuation = cont }
-        let task = Task {
+        let task = Task.detached {
+            defer { continuation.finish() }
             let result = try await self.resume(checkpointURL: checkpointURL) { progress in
                 continuation.yield(progress)
             }
-            continuation.finish()
             return result
         }
         return (stream, task)
@@ -394,9 +422,10 @@ public final class RecoveryEngine {
                                onProgress: ((ScanProgress) -> Void)?) -> [FileCandidate] {
         var results: [FileCandidate] = []
         let fsType = detectFileSystem(device)
-        log.info("Detected file system: \(fsType.rawValue)")
+        print("[QuickScan] Detected filesystem: \(fsType.rawValue)")
 
         let pathCallback: (String) -> Void = { path in
+            print("[QuickScan] Scanning: \(path)  (\(results.count) found so far)")
             onProgress?(ScanProgress(
                 phase: .quickScan, percent: 50,
                 quickScanPercent: 50, deepScanPercent: 0,
@@ -409,33 +438,37 @@ public final class RecoveryEngine {
 
         switch fsType {
         case .hfsPlus:
+            print("[QuickScan] Running HFS+ parser")
             do {
                 results = try HFSParser.findDeletedFiles(device: device,
                                                          sectorMap: map,
                                                          onPath: pathCallback)
             } catch {
-                log.warning("HFS+ quick scan failed: \(error.localizedDescription)")
+                print("[QuickScan] HFS+ parser error: \(error)")
             }
         case .apfs:
+            print("[QuickScan] Running APFS parser")
             do {
                 results = try APFSParser.findFiles(device: device,
                                                    sectorMap: map,
                                                    onPath: pathCallback)
             } catch {
-                log.warning("APFS quick scan failed: \(error.localizedDescription)")
+                print("[QuickScan] APFS parser error: \(error)")
             }
         case .fat32, .exFAT:
+            print("[QuickScan] Running FAT/exFAT parser")
             do {
                 results = try FATParser.findFiles(device: device,
                                                   sectorMap: map,
                                                   onPath: pathCallback)
             } catch {
-                log.warning("FAT quick scan failed: \(error.localizedDescription)")
+                print("[QuickScan] FAT parser error: \(error)")
             }
         default:
-            log.warning("Unrecognised file system — quick scan skipped, use deep scan")
+            print("[QuickScan] Unknown filesystem — skipping quick scan")
         }
 
+        print("[QuickScan] Done — \(results.count) candidates")
         return results
     }
 
@@ -452,21 +485,17 @@ public final class RecoveryEngine {
         // Build a sorted array of sector ranges already found by the quick scan.
         // Using ranges + binary search avoids materialising millions of individual
         // UInt64 values into a Set (a 1 GB file alone would produce ~2M entries).
+        // Exclude candidates whose location is unknown (startSector==0, sectorCount==0).
+        // Including startSector==0 would claim sector 0 and make deep scan skip it,
+        // and unknown-location candidates (e.g. APFS without extent data) must not
+        // block carving.
         let claimedRanges: [Range<UInt64>] = existingCandidates
-            .filter { $0.sectorCount > 0 }
+            .filter { $0.sectorCount > 0 && $0.startSector > 0 }
             .map    { $0.startSector..<$0.endSector }
             .sorted { $0.lowerBound < $1.lowerBound }
 
         func isClaimed(_ sector: UInt64) -> Bool {
-            // Binary-search for the last range whose lowerBound <= sector,
-            // then check whether that range actually contains the sector.
-            var lo = 0, hi = claimedRanges.count
-            while lo < hi {
-                let mid = (lo + hi) / 2
-                if claimedRanges[mid].lowerBound <= sector { lo = mid + 1 }
-                else { hi = mid }
-            }
-            return lo > 0 && claimedRanges[lo - 1].contains(sector)
+            RecoveryEngine.isInClaimedRanges(sector, ranges: claimedRanges)
         }
 
         var results:      [FileCandidate] = []
@@ -476,6 +505,8 @@ public final class RecoveryEngine {
         let totalBytes    = device.totalBytes
         let quickDone     = (config.mode == .both || config.mode == .quick)
         var speedSamples: [(time: Date, bytes: UInt64)] = []
+
+        print("[DeepScan] Starting at sector \(resumeSector) / \(device.totalSectors) total")
 
         while sector < device.totalSectors {
 
@@ -532,6 +563,7 @@ public final class RecoveryEngine {
                 )
                 results.append(candidate)
                 map.mark(sector: detSector, as: .candidate)
+                print("[DeepScan] ✓ Found \(detection.fileType.rawValue) at sector \(detSector) (~\(sectorCount * UInt64(device.sectorSize) / 1024)KB) [\(recoverability)]")
                 if results.count >= config.maxCandidates { break }
             }
 
@@ -543,6 +575,8 @@ public final class RecoveryEngine {
 
             let progressEvery: UInt64 = 1024
             if sector % progressEvery == 0 {
+                let pct = device.totalSectors > 0 ? Int(sector * 100 / device.totalSectors) : 0
+                print("[DeepScan] sector \(sector)/\(device.totalSectors) (\(pct)%) — \(results.count) found")
                 let p = map.progress()
                 speedSamples.append((Date(), bytesRead))
                 if speedSamples.count > 10 { speedSamples.removeFirst() }
@@ -582,16 +616,35 @@ public final class RecoveryEngine {
     private func deduplicateCandidates(_ candidates: [FileCandidate]) -> [FileCandidate] {
         guard candidates.count > 1 else { return candidates }
 
+        // Sort by startSector so that all candidates in `kept` have startSector ≤ current.
+        // That makes the domination check: ∃ kept[i] where endSector ≥ candidate.endSector
+        // AND recoverability ≥ candidate.recoverability.
+        //
+        // We track the maximum endSector seen per recoverability level.
+        // A candidate is dominated when any level ≥ its own has a maxEnd ≥ its endSector.
+        // This reduces the inner loop from O(n) to O(|RecoverabilityScore levels|) = O(4).
         let sorted = candidates.sorted { $0.startSector < $1.startSector }
         var kept:   [FileCandidate] = []
+        var maxEnd: [RecoverabilityScore: UInt64] = [:]
 
         for candidate in sorted {
-            let dominated = kept.contains { existing in
-                existing.startSector <= candidate.startSector &&
-                existing.endSector   >= candidate.endSector   &&
-                existing.recoverability >= candidate.recoverability
+            // Skip zero-sector candidates (unknown location) — never dominated, always kept.
+            guard candidate.sectorCount > 0 else {
+                kept.append(candidate)
+                continue
             }
-            if !dominated { kept.append(candidate) }
+            var dominated = false
+            for (score, end) in maxEnd {
+                if score >= candidate.recoverability && end >= candidate.endSector {
+                    dominated = true
+                    break
+                }
+            }
+            if !dominated {
+                kept.append(candidate)
+                let prev = maxEnd[candidate.recoverability] ?? 0
+                maxEnd[candidate.recoverability] = max(prev, candidate.endSector)
+            }
         }
 
         return kept.sorted {
@@ -677,6 +730,19 @@ public final class RecoveryEngine {
         let seconds = last.time.timeIntervalSince(first.time)
         guard seconds > 0.001 else { return 0 }
         return Double(last.bytes - first.bytes) / seconds / 1_048_576
+    }
+
+    /// Binary-search `ranges` (must be sorted by lowerBound) for `sector`.
+    /// Internal so tests can exercise the lookup without running a full scan.
+    static func isInClaimedRanges(_ sector: UInt64,
+                                   ranges: [Range<UInt64>]) -> Bool {
+        var lo = 0, hi = ranges.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if ranges[mid].lowerBound <= sector { lo = mid + 1 }
+            else { hi = mid }
+        }
+        return lo > 0 && ranges[lo - 1].contains(sector)
     }
 }
 

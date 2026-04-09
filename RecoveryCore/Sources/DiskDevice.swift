@@ -1,4 +1,5 @@
 import Foundation
+import DiskArbitration
 import os.log
 
 private let log = Logger(subsystem: "com.macrecovery", category: "DiskDevice")
@@ -30,9 +31,22 @@ public final class DiskDevice {
 
     public static func open(path: String,
                             sectorSize: UInt32 = 512) throws -> DiskDevice {
-        let fd = Darwin.open(path, O_RDONLY | O_NONBLOCK)
+        // macOS raw devices (/dev/rdisk*) support DK ioctls and unbuffered I/O.
+        // Block device nodes (/dev/disk*) do NOT support DKIOCGETBLOCKCOUNT or
+        // lseek(SEEK_END). Always use the raw path for /dev/disk* entries.
+        let effectivePath: String
+        if path.hasPrefix("/dev/disk") {
+            effectivePath = "/dev/r" + path.dropFirst("/dev/".count)  // disk6 → rdisk6
+        } else {
+            effectivePath = path
+        }
+        fputs("[DiskDevice] open: \(path) → \(effectivePath)\n", stderr)
+
+        // O_NONBLOCK must NOT be used for raw disk devices — it causes ioctls
+        // (DKIOCGETBLOCKCOUNT etc.) to return ENOTTY on many USB controllers.
+        let fd = Darwin.open(effectivePath, O_RDONLY)
         guard fd >= 0 else {
-            throw DiskError.openFailed(path: path, errno: errno)
+            throw DiskError.openFailed(path: effectivePath, errno: errno)
         }
 
         // Determine device size.
@@ -46,16 +60,39 @@ public final class DiskDevice {
             throw DiskError.statFailed(path: path, errno: errno)
         }
 
-        if (st.st_mode & S_IFMT) == S_IFBLK {
-            // Block device — use IOKit ioctl
-            var blockCount: UInt64 = 0
-            var blockSize:  UInt32 = 0
-            if ioctl(fd, _DKIOCGETBLOCKCOUNT, &blockCount) == 0,
-               ioctl(fd, _DKIOCGETBLOCKSIZE, &blockSize) == 0 {
-                totalBytes = blockCount * UInt64(blockSize)
+        let fileType = st.st_mode & S_IFMT
+        let isDevice = fileType == S_IFBLK || fileType == S_IFCHR
+        fputs("[DiskDevice] \(path) fileType=0x\(String(fileType, radix:16)) isDevice=\(isDevice)\n", stderr)
+
+        if isDevice {
+            // Strategy 1: lseek(SEEK_END) — works on some raw device nodes
+            let seekSize = lseek(fd, 0, SEEK_END)
+            lseek(fd, 0, SEEK_SET)
+            fputs("[DiskDevice] lseek SEEK_END → \(seekSize)\n", stderr)
+
+            if seekSize > 0 {
+                totalBytes = UInt64(seekSize)
             } else {
-                Darwin.close(fd)
-                throw DiskError.ioctlFailed(path: path, errno: errno)
+                // Strategy 2: IOKit DK ioctls
+                var blockCount: UInt64 = 0
+                var blockSize:  UInt32 = 0
+                let r1 = ioctl(fd, _DKIOCGETBLOCKCOUNT, &blockCount)
+                let r2 = ioctl(fd, _DKIOCGETBLOCKSIZE,  &blockSize)
+                fputs("[DiskDevice] ioctl r1=\(r1) r2=\(r2) blockCount=\(blockCount) blockSize=\(blockSize)\n", stderr)
+                if r1 == 0, r2 == 0, blockCount > 0 {
+                    totalBytes = blockCount * UInt64(blockSize)
+                } else {
+                    // Strategy 3: DiskArbitration — the same API used by VolumeEnumerator.
+                    // Reliable on USB/exFAT external drives where lseek and DK ioctls both
+                    // return 0 / ENOTTY (e.g. PS5 external storage, SDXC cards).
+                    if let daBytes = diskArbitrationSize(rawPath: effectivePath), daBytes > 0 {
+                        fputs("[DiskDevice] DiskArbitration size → \(daBytes)\n", stderr)
+                        totalBytes = daBytes
+                    } else {
+                        Darwin.close(fd)
+                        throw DiskError.ioctlFailed(path: path, errno: errno)
+                    }
+                }
             }
         } else {
             // Regular file (disk image)
@@ -64,6 +101,7 @@ public final class DiskDevice {
 
         let totalSectors = totalBytes / UInt64(sectorSize)
         log.info("Opened \(path): \(totalBytes) bytes, \(totalSectors) sectors @ \(sectorSize)B")
+        fputs("[DiskDevice] Opened \(path): \(totalBytes) bytes (\(totalBytes / 1_000_000_000) GB), \(totalSectors) sectors\n", stderr)
 
         return DiskDevice(path: path, fd: fd,
                           sectorSize: sectorSize,
@@ -163,6 +201,37 @@ public final class DiskDevice {
         self.sectorSize   = sectorSize
         self.totalSectors = totalSectors
         self.totalBytes   = totalBytes
+    }
+
+    /// Strip the partition suffix from a BSD device path.
+    /// "/dev/disk6s1"  → "/dev/disk6"
+    /// "/dev/rdisk6s2" → "/dev/rdisk6"
+    /// Returns nil if the path has no partition suffix (already a whole-disk node).
+    static func wholeDiskPath(_ path: String) -> String? {
+        guard let range = path.range(of: #"s\d+$"#, options: .regularExpression) else {
+            return nil
+        }
+        return String(path[..<range.lowerBound])
+    }
+
+    /// Ask DiskArbitration for the media size of a raw device path.
+    /// `rawPath` should be the /dev/rdiskN or /dev/diskN form.
+    /// DA uses just the BSD name without /dev/ prefix and without the leading 'r'.
+    private static func diskArbitrationSize(rawPath: String) -> UInt64? {
+        // Convert "/dev/rdisk6s1" → "disk6s1", "/dev/rdisk6" → "disk6"
+        var bsdName = rawPath
+        if bsdName.hasPrefix("/dev/rdisk") {
+            bsdName = "disk" + String(bsdName.dropFirst("/dev/rdisk".count))
+        } else if bsdName.hasPrefix("/dev/disk") {
+            bsdName = String(bsdName.dropFirst("/dev/".count))
+        }
+
+        guard let session = DASessionCreate(kCFAllocatorDefault) else { return nil }
+        guard let disk    = DADiskCreateFromBSDName(kCFAllocatorDefault,
+                                                    session, bsdName) else { return nil }
+        guard let descRaw = DADiskCopyDescription(disk) else { return nil }
+        let desc = descRaw as NSDictionary
+        return (desc[kDADiskDescriptionMediaSizeKey] as? NSNumber)?.uint64Value
     }
 }
 
